@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -646,6 +646,12 @@ pub struct SonarClient {
     push_token_cache_path: Option<PathBuf>,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// Highest Marmot protocol version this build advertises in its Sonar meta
+    /// descriptor (`sonar_protocol`). Defaults to MDK (1); a Darkmatter-capable
+    /// build flips it to 2 via [`SonarClient::set_advertised_sonar_protocol`]
+    /// when the experimental dev toggle is on. Peers read it to choose the engine
+    /// for a NEW conversation (see `sonar_descriptor::negotiate`).
+    advertised_sonar_protocol: Arc<AtomicU8>,
 }
 
 impl SonarClient {
@@ -1058,6 +1064,9 @@ impl SonarClient {
             push_token_cache,
             push_token_cache_path,
             own_push_registration: Arc::new(Mutex::new(None)),
+            advertised_sonar_protocol: Arc::new(AtomicU8::new(
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -1269,12 +1278,32 @@ impl SonarClient {
         // emitting the meta with `None` would clobber a previously-published
         // offer on the relays and make us unpayable — an offer-less / not-yet-
         // ready publish must never wipe a known offer. See `descriptor_events`.
-        for (d_tag, content) in descriptor_events(calls_enabled, signaling, bolt12_offer)? {
+        for (d_tag, content) in descriptor_events(
+            calls_enabled,
+            signaling,
+            bolt12_offer,
+            self.advertised_sonar_protocol.load(Ordering::Relaxed),
+        )? {
             let builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
                 .tags(descriptor_tags(d_tag));
             self.nostr.send_event_builder(builder).await?;
         }
         Ok(())
+    }
+
+    /// Highest Marmot protocol version this build advertises (1 = MDK,
+    /// 2 = Darkmatter). The next `publish_sonar_descriptor` carries it.
+    pub fn advertised_sonar_protocol(&self) -> u8 {
+        self.advertised_sonar_protocol.load(Ordering::Relaxed)
+    }
+
+    /// Set the advertised Marmot protocol capability. A Darkmatter-capable build
+    /// calls this with [`crate::sonar_descriptor::SONAR_PROTOCOL_DARKMATTER`] when
+    /// the experimental dev toggle is on, then republishes the descriptor so peers
+    /// can negotiate v2 for NEW conversations. Existing conversations are unaffected.
+    pub fn set_advertised_sonar_protocol(&self, protocol: u8) {
+        self.advertised_sonar_protocol
+            .store(protocol, Ordering::Relaxed);
     }
 
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
@@ -4184,8 +4213,13 @@ mod tests {
             &keys,
             SONAR_META_DESCRIPTOR_D_TAG,
             10,
-            meta_descriptor_content_json(true, vec!["marmot".to_string()], Some(offer.to_string()))
-                .expect("meta descriptor json"),
+            meta_descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                Some(offer.to_string()),
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("meta descriptor json"),
         );
         let new_call = signed_descriptor_event(
             &keys,
@@ -4214,15 +4248,25 @@ mod tests {
             &keys,
             SONAR_META_DESCRIPTOR_D_TAG,
             10,
-            meta_descriptor_content_json(true, vec!["marmot".to_string()], Some(offer.to_string()))
-                .expect("meta descriptor json"),
+            meta_descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                Some(offer.to_string()),
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("meta descriptor json"),
         );
         let clear_meta = signed_descriptor_event(
             &keys,
             SONAR_META_DESCRIPTOR_D_TAG,
             20,
-            meta_descriptor_content_json(true, vec!["marmot".to_string()], None)
-                .expect("meta descriptor json"),
+            meta_descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                None,
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("meta descriptor json"),
         );
         let new_call = signed_descriptor_event(
             &keys,
