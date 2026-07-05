@@ -73,6 +73,8 @@ final class MarmotService: @unchecked Sendable {
         /// Core-computed classification; `.text` for local echoes and rows
         /// decoded from older on-disk encodes.
         let classification: MarmotMessageClass
+        /// Aggregated NIP-25 emoji reactions, sorted by (count desc, emoji asc).
+        let reactions: [MessageReaction]
 
         init(
             id: String,
@@ -83,7 +85,8 @@ final class MarmotService: @unchecked Sendable {
             deliveryState: String? = nil,
             media: [MarmotMedia],
             stickerRef: MarmotStickerRef? = nil,
-            classification: MarmotMessageClass = .text
+            classification: MarmotMessageClass = .text,
+            reactions: [MessageReaction] = []
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -94,6 +97,7 @@ final class MarmotService: @unchecked Sendable {
             self.media = media
             self.stickerRef = stickerRef
             self.classification = classification
+            self.reactions = reactions
         }
 
         enum CodingKeys: String, CodingKey {
@@ -106,6 +110,7 @@ final class MarmotService: @unchecked Sendable {
             case media
             case stickerRef
             case classification
+            case reactions
         }
 
         init(from decoder: Decoder) throws {
@@ -120,6 +125,7 @@ final class MarmotService: @unchecked Sendable {
             self.stickerRef = try container.decodeIfPresent(MarmotStickerRef.self, forKey: .stickerRef)
             self.classification =
                 try container.decodeIfPresent(MarmotMessageClass.self, forKey: .classification) ?? .text
+            self.reactions = try container.decodeIfPresent([MessageReaction].self, forKey: .reactions) ?? []
         }
     }
 
@@ -584,6 +590,19 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().sendText(groupIdHex: groupId, text: text) }
     }
 
+    /// Toggle the local identity's NIP-25 emoji reaction on a message (Signal
+    /// tapback semantics in the core: same emoji clears, a different emoji
+    /// replaces). The core fires the conversation-changed listener afterwards.
+    func toggleReaction(groupId: String, messageId: String, emoji: String) async throws {
+        try await run {
+            try $0.requireNode().toggleReaction(
+                groupIdHex: groupId,
+                targetMessageIdHex: messageId,
+                emoji: emoji
+            )
+        }
+    }
+
     /// Encrypt `data`, upload the ciphertext to a Blossom server, and publish a
     /// media message to the group. `serverUrl` empty → the core default.
     func sendMedia(
@@ -794,7 +813,10 @@ final class MarmotService: @unchecked Sendable {
                     plaintextSha256: $0.plaintextSha256
                 )
             },
-            classification: Self.marmotMessageClass(message.classification)
+            classification: Self.marmotMessageClass(message.classification),
+            reactions: message.reactions.map {
+                MessageReaction(emoji: $0.emoji, count: Int($0.count), mine: $0.mine)
+            }
         )
     }
 

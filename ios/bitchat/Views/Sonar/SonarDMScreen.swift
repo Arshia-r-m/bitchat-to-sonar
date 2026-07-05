@@ -56,6 +56,8 @@ struct SonarDMScreenContent: View {
     @State private var pickPhoto = false
     @State private var photoItem: PhotosPickerItem?
     @State private var previewPackCoordinate: String?
+    /// Message id awaiting an emoji from the full picker ("More reactions…").
+    @State private var reactionTargetId: String?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil || store.isPendingSecureChat(peerId) }
@@ -128,7 +130,11 @@ struct SonarDMScreenContent: View {
                     fiatText: { store.moneySatsLine($0) },
                     loadMedia: { await store.mediaData($0) },
                     loadSticker: { await store.stickerImageData(for: $0) },
-                    onTapPack: { previewPackCoordinate = $0 }
+                    onTapPack: { previewPackCoordinate = $0 },
+                    onToggleReaction: { m, emoji in
+                        store.toggleReaction(peerId, messageId: m.id, emoji: emoji)
+                    },
+                    onMoreReactions: { m in reactionTargetId = m.id }
                 )
             }
 
@@ -268,6 +274,29 @@ struct SonarDMScreenContent: View {
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
+        }
+        .snSheet(
+            isPresented: Binding(
+                get: { reactionTargetId != nil },
+                set: { if !$0 { reactionTargetId = nil } }
+            ),
+            title: "React"
+        ) {
+            SonarEmojiPickerView(
+                onEmoji: { emoji in
+                    if let targetId = reactionTargetId {
+                        store.toggleReaction(peerId, messageId: targetId, emoji: emoji)
+                    }
+                    reactionTargetId = nil
+                },
+                onSticker: { _, _ in reactionTargetId = nil },
+                loadStickerPack: { author, identifier, relays in
+                    await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                },
+                loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+                fetchInstalledPacks: { await store.fetchInstalledPacks() },
+                onClose: { reactionTargetId = nil }
+            )
         }
         // iOS presents the media preview full-screen; macOS has no
         // fullScreenCover, so fall back to a sheet (same content/behavior).

@@ -56,6 +56,11 @@ const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
+/// App-layer mesh reaction control line (`⚡REACT|1|<meshMsgId>|<emoji>|<verb>`).
+/// It rides the Marmot fallback leg as normal kind-9 content when the peer is
+/// out of BLE range; the drain path must treat it as a reaction, not a message.
+const MESH_REACTION_LINE_PREFIX: &str = "⚡REACT|";
+
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
 /// fresh connect + handshake per download (the White Noise reference client
@@ -1823,6 +1828,61 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Toggle the local user's reaction on `target` (Signal tapback
+    /// semantics): reacting with the current emoji again clears it, a
+    /// different emoji replaces it. Same local-first sequencing as
+    /// [`Self::send_text`]: the kind-7 rumor is stored and outbox-tracked
+    /// before the background relay publish. Reactions never touch the
+    /// conversation index (the chat-list preview stays on the last real
+    /// message) and produce no drain notification on the receiver.
+    pub async fn toggle_reaction(
+        &self,
+        group_id: &GroupId,
+        target: &EventId,
+        emoji: &str,
+    ) -> Result<()> {
+        let emoji = emoji.trim();
+        if emoji.is_empty() {
+            return Err(Error::InvalidInput("reaction emoji is empty".into()));
+        }
+        let desired = match self.engine.my_reaction(group_id, target)? {
+            Some(current) if current == emoji => String::new(), // clear
+            _ => emoji.to_string(),
+        };
+        let event = self
+            .engine
+            .create_reaction_message(group_id, target, &desired)?;
+        let incoming = self.engine.process_incoming(&event).await?;
+        let Incoming::Reaction(message) = incoming else {
+            return Err(Error::Storage(
+                "created reaction did not produce a local reaction row".into(),
+            ));
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        self.spawn_reaction_bookkeeping(event_id);
+        self.spawn_push_notification(group_id.clone());
+        Ok(())
+    }
+
+    /// Deferred sync-state bookkeeping for a sent reaction. Unlike
+    /// [`Self::spawn_send_bookkeeping`] this never upserts the conversation
+    /// index — a reaction must not clobber the chat-list preview row.
+    fn spawn_reaction_bookkeeping(&self, event_id: EventId) {
+        let sync_state = self.sync_state.clone();
+        let event_id_hex = event_id.to_hex();
+        std::thread::spawn(move || {
+            let mut state = sync_state.lock().unwrap();
+            state.mark_processed_id(event_id_hex);
+            if let Err(e) = state.save_if_dirty() {
+                tracing::debug!(%e, "deferred sync-state persist failed");
+            }
+        });
+    }
+
     /// Fetch a sticker pack from relays by its pack address coordinate.
     pub async fn fetch_sticker_pack(
         &self,
@@ -1991,8 +2051,9 @@ impl SonarClient {
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
-        let Incoming::Message(message) = incoming else {
-            return;
+        let message = match incoming {
+            Incoming::Message(message) | Incoming::Reaction(message) => message,
+            _ => return,
         };
         if !message.mine {
             return;
@@ -2900,8 +2961,32 @@ impl SonarClient {
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
+                Ok(ref incoming @ Incoming::Reaction(ref message)) => {
+                    // Reactions update the transcript aggregates only: refresh
+                    // the conversation so open UIs refetch, but never index
+                    // (chat-list preview) or notify.
+                    self.record_delivery_for_incoming(incoming);
+                    changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
+                    // Mesh-referencing reactions ride the Marmot fallback leg
+                    // as `⚡REACT|…` control lines inside a normal kind-9 (a
+                    // kind-7 e-tag cannot reference a mesh message id). Treat
+                    // them like kind-7 reactions: refresh only — no chat-list
+                    // preview/unread churn and no notification. Trust note: a
+                    // peer could prefix ordinary text to skip their own
+                    // message's notification, which only suppresses their own
+                    // send (content is peer-controlled anyway) and the app
+                    // layers hide `⚡REACT|` lines from transcripts regardless.
+                    if message.content.starts_with(MESH_REACTION_LINE_PREFIX) {
+                        changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
+                    }
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());

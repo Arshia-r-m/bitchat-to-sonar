@@ -44,7 +44,12 @@ data class SonarMsg(
     val state: String? = null,
     /// Sticker reference if this message is a sticker send.
     val stickerRef: SonarStickerRef? = null,
+    /// Aggregated emoji reactions (count desc, emoji asc). Empty when nobody reacted.
+    val reactions: List<SonarReaction> = emptyList(),
 )
+
+/** One aggregated emoji reaction on a message. [mine] = my current reaction. */
+data class SonarReaction(val emoji: String, val count: Int, val mine: Boolean)
 
 /** Account-level direct NIP-17 DM decoded from a `bitchat1:` embedded packet. */
 data class SonarDirectDm(
@@ -451,6 +456,10 @@ expect object SonarCore {
 
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)
+
+    /** Toggle my NIP-25 reaction on a message (Signal tapback semantics: same
+     *  emoji again clears, a different emoji replaces). */
+    suspend fun toggleReaction(chatId: String, messageId: String, emoji: String)
 
     /** Encrypt + upload [data] to a Blossom server, then publish a media message
      *  to the chat. [serverUrl] empty → the core default. */

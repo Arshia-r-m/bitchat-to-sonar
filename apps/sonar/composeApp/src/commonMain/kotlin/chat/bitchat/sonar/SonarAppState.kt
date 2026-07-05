@@ -123,6 +123,7 @@ private fun messagePreview(content: String, stickerRef: SonarStickerRef? = null,
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
+    if (ReactionLine.decode(content) != null) return "Reaction"
     return if (PayLine.decode(content) != null) "₿ Payment" else content
 }
 
@@ -1364,7 +1365,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             socialNpubHexForChat(chat.id)?.let { socialState.isBlockedNostr(it) } == true
 
     private fun visibleMessagesForChat(chatId: String, source: List<SonarMsg>): List<SonarMsg> =
-        source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
+        foldMeshReactions(source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) })
 
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         val visible = visibleMessagesForChat(chatId, source)
@@ -2592,6 +2593,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             val s = summaryByChat[chatId] ?: continue
             lastSeenTs[chatId] = s.latestAtSecs
             if (s.latestMine) continue
+            // Reactions must never ring: the core index already excludes kind-7
+            // and ⚡REACT lines, but guard here too so a tapback can never
+            // surface as a "new message" notification.
+            if (ReactionLine.isReactionLine(s.latestContent)) continue
             if (!socialState.allowsChatMessage(chatId, s.latestSenderNpub, mine = false)) continue
             if (newestIncoming == null || s.latestAtSecs > newestIncoming!!.tsSecs) {
                 newestIncoming = SonarMsg(
@@ -3577,6 +3582,61 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Signal-style tapback: same emoji again clears, a different emoji replaces.
+     *  Marmot chats toggle through the core (NIP-25 kind-7); mesh chats ride a
+     *  ⚡REACT control line over the normal DM route and fold at display time. */
+    fun toggleReaction(chatId: String, messageId: String, emoji: String) {
+        val e = emoji.trim()
+        if (e.isEmpty()) return
+        if (isContactBlocked(chatId)) {
+            toast = "Unblock this contact before reacting."
+            return
+        }
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            scope.launch {
+                // A folded Sonar-peer DM renders the White Noise/Marmot leg
+                // under the mesh chat id. A reaction to a Marmot-leg message
+                // must be a real NIP-25 kind-7 through the core (syncs via
+                // relays and merges with core aggregates), not a ⚡REACT line.
+                val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
+                    ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
+                for (group in groups) {
+                    if (marmotMessages(group.id).any { it.id == messageId }) {
+                        runCatching { SonarCore.toggleReaction(group.id, messageId, e) }
+                            .onFailure { toast = "reaction failed: ${it.message}" }
+                        refreshOpenDm(peerId)
+                        return@launch
+                    }
+                }
+                val myCurrent = messages.firstOrNull { it.id == messageId }
+                    ?.reactions?.firstOrNull { it.mine }?.emoji
+                val line = ReactionLine(messageId, e, add = myCurrent != e)
+                // Self-check: never emit a line the receivers would reject
+                // (e.g. a not-yet-published local echo id) — matches iOS,
+                // where reacting to a pending message is a no-op.
+                if (ReactionLine.decode(line.encoded()) == null) return@launch
+                sendDmAuto(peerId, line.encoded())
+            }
+            return
+        }
+        if (isPendingSecureChat(chatId)) return
+        scope.launch {
+            // A deduped direct row can back several duplicate Marmot groups —
+            // the target message lives in exactly one of them.
+            var lastError: Throwable? = null
+            for (groupId in directMarmotChatIds(chatId)) {
+                try {
+                    SonarCore.toggleReaction(groupId, messageId, e)
+                    return@launch
+                } catch (t: Throwable) {
+                    lastError = t
+                }
+            }
+            toast = "reaction failed: ${lastError?.message}"
+        }
+    }
+
     // ── Optimistic send echoes ──
     // Mirrors iOS local echo: show the message immediately in the transcript
     // while the MLS encrypt + relay publish runs in the background. Keyed by
@@ -4332,7 +4392,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val chatId = meshChatId(peerId)
         val messageId = randomMeshId()
         val echo = createSendEcho(chatId, text)
-        messages = (messages + echo).sortedBy { it.tsSecs }
+        messages = foldMeshReactions((messages + echo).sortedBy { it.tsSecs })
         scope.launch {
             val delivered = sendDirectNip17Now(peerId, npubRaw, messageId, text)
             if (delivered) {
@@ -4494,7 +4554,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (group != null) {
             val chatId = meshChatId(peerId)
             val echo = createSendEcho(chatId, text)
-            messages = (messages + echo).sortedBy { it.tsSecs }
+            // Fold so an optimistic ⚡REACT echo shows as a reaction, not a raw line.
+            messages = foldMeshReactions((messages + echo).sortedBy { it.tsSecs })
             scope.launch {
                 try {
                     SonarCore.send(group.id, text)
@@ -5002,7 +5063,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = chatSnapshotMessagesByChat[group.id]?.lastOrNull()
+            // Skip ⚡REACT fallback lines: reactions never drive row preview/time.
+            val msg = chatSnapshotMessagesByChat[group.id]
+                ?.lastOrNull { !ReactionLine.isReactionLine(it.content) }
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
         }
@@ -5157,6 +5220,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             processPayLines(chatId, listOf(msg))
             touched += m.peerId
+            // ⚡REACT lines persist with the transcript but never notify.
+            if (stickerRef == null && ReactionLine.decode(m.text) != null) continue
             val preview = if (stickerRef != null) "Sticker" else m.text
             val sender = meshPeerName(m.peerId)
             notifyIncoming(
@@ -5225,6 +5290,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             processPayLines(chatId, listOf(msg))
             touched += peerId
             ackEventIds += m.eventId
+            if (msg.stickerRef == null && ReactionLine.decode(m.content) != null) continue
             val preview = if (msg.stickerRef != null) "Sticker" else m.content
             notifyIncoming(chatId, meshPeerName(peerId), preview)
         }
@@ -5339,8 +5405,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshDmRows = meshChats.entries
             .filter { it.value.isNotEmpty() }
             .filterNot { (pid, _) -> socialState.isBlockedPeer(pid) }
-            .map { (pid, msgs) ->
-                val last = msgs.last()
+            .mapNotNull { (pid, msgs) ->
+                // ⚡REACT control lines never drive the row preview/time.
+                val last = msgs.lastOrNull { !ReactionLine.isReactionLine(it.content) }
+                    ?: return@mapNotNull null
                 MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs)
             }
             .sortedByDescending { it.tsSecs }
@@ -5363,7 +5431,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         for ((peerId, msgs) in meshChats) {
             if (msgs.isEmpty()) continue
             if (socialState.isBlockedPeer(peerId)) continue
-            var last = msgs.last()
+            // ⚡REACT control lines never drive the row preview/time.
+            var last = msgs.lastOrNull { !ReactionLine.isReactionLine(it.content) } ?: continue
             val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty()
             if (groups.isNotEmpty()) {
                 groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }

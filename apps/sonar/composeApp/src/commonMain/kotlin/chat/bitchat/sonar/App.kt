@@ -708,6 +708,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var removePeopleSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
+    // Long-pressed message awaiting a reaction pick (Signal tapback).
+    var reactFor by remember { mutableStateOf<SonarMsg?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
         state.stageMediaPreview(screen.id, bytes, name, mime)
@@ -950,6 +952,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 cont = cont,
                                 showState = m.mine && i == feed.lastIndex,
                                 maxBubbleWidth = bubbleMax,
+                                onLongPress = { reactFor = m },
+                                onReact = { emoji -> state.toggleReaction(screen.id, m.id, emoji) },
                             )
                         }
                     }
@@ -1155,6 +1159,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onVerify = { state.markVerified(screen.id); verifySheet = false },
         onDismiss = { verifySheet = false }
     )
+    reactFor?.let { target ->
+        ReactionSheet(
+            message = target,
+            onPick = { emoji ->
+                state.toggleReaction(screen.id, target.id, emoji)
+                reactFor = null
+            },
+            onClose = { reactFor = null },
+        )
+    }
     previewPackCoordinate?.let { coord ->
         StickerPackPreviewSheet(state, coord) { previewPackCoordinate = null }
     }
@@ -1203,6 +1217,70 @@ private fun AddToMessageSheet(
                 }
                 if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
                 ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
+            }
+        }
+    }
+}
+
+/** Signal-style quick tapback bar (long-press a bubble). */
+private val quickReactions = listOf("❤️", "👍", "👎", "😂", "😮", "😢")
+
+/** Long-press message sheet: quick tapback bar, "+" for the full emoji picker,
+ *  and Copy (which replaces the SelectionContainer copy the bubble gave up). */
+@Composable
+private fun ReactionSheet(
+    message: SonarMsg,
+    onPick: (String) -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    var fullPicker by remember(message.id) { mutableStateOf(false) }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        if (fullPicker) {
+            chat.bitchat.sonar.screens.SonarEmojiPicker(
+                onEmoji = onPick,
+                onGif = {},
+                onSticker = { _, _ -> },
+                onClose = onClose,
+            )
+        } else {
+            Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+                Column(
+                    Modifier.fillMaxWidth()
+                        .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        quickReactions.forEach { e ->
+                            val mine = message.reactions.any { it.mine && it.emoji == e }
+                            Box(
+                                Modifier.size(44.dp).clip(CircleShape)
+                                    .background(if (mine) s.accentSoft else s.surface2)
+                                    .clickable { onPick(e) },
+                                contentAlignment = Alignment.Center
+                            ) { Text(e, fontSize = 22.sp) }
+                        }
+                        Box(
+                            Modifier.size(44.dp).clip(CircleShape).background(s.surface2)
+                                .clickable { fullPicker = true },
+                            contentAlignment = Alignment.Center
+                        ) { SNIcon(SNIconName.Plus, 20.dp, s.text2, weight = 2.4f) }
+                    }
+                    if (message.content.isNotBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        ActionRow(SNIconName.Pencil, "Copy", "Copy the message text") {
+                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(message.content))
+                            onClose()
+                        }
+                    }
+                }
             }
         }
     }
@@ -1493,6 +1571,7 @@ private const val BUBBLE_META_ICON = "sn.meta.via"
  *  colored own bubbles (cyan mesh / indigo internet), tail corner at 28% of the
  *  18dp radius, and the time + via icon inlined at the end of the text. */
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun MessageBubble(
     m: SonarMsg,
     mesh: Boolean = false,
@@ -1500,6 +1579,8 @@ private fun MessageBubble(
     cont: Boolean = false,
     showState: Boolean = false,
     maxBubbleWidth: Dp = Dp.Infinity,
+    onLongPress: (() -> Unit)? = null,
+    onReact: ((String) -> Unit)? = null,
 ) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
@@ -1551,19 +1632,39 @@ private fun MessageBubble(
         Box(
             Modifier.widthIn(max = maxBubbleWidth).clip(shape)
                 .background(if (m.mine) mineBg else s.bubbleOther)
-                .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
+                .then(
+                    when {
+                        onLongPress != null -> Modifier.combinedClickable(
+                            onClick = { firstUrl?.let { uriHandler.openUri(it) } },
+                            onLongClick = onLongPress,
+                        )
+                        firstUrl != null -> Modifier.clickable { uriHandler.openUri(firstUrl) }
+                        else -> Modifier
+                    }
+                )
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
-            // Selectable (long-press → Copy); tap opens a link if present —
-            // mirrors the iOS deterministic copy + tappable-link behavior.
-            androidx.compose.foundation.text.selection.SelectionContainer {
+            if (onLongPress != null) {
+                // No SelectionContainer here: its selection gesture would swallow
+                // the reaction long-press; Copy lives in the long-press sheet.
                 Text(
                     annotated, color = if (m.mine) onMine else s.text,
                     fontSize = 16.sp, lineHeight = 22.4.sp,
                     inlineContent = inline,
                 )
+            } else {
+                // Selectable (long-press → Copy); tap opens a link if present —
+                // mirrors the iOS deterministic copy + tappable-link behavior.
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(
+                        annotated, color = if (m.mine) onMine else s.text,
+                        fontSize = 16.sp, lineHeight = 22.4.sp,
+                        inlineContent = inline,
+                    )
+                }
             }
         }
+        if (m.reactions.isNotEmpty()) ReactionChipsRow(m.reactions, onReact)
         if (showState) MessageStatusFooter(m, mesh)
     }
 }
@@ -1574,6 +1675,37 @@ private fun DateChip(label: String) {
     val s = sonar
     Box(Modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = Alignment.Center) {
         Text(label, color = s.text3, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Compact `emoji count` chips under a bubble; my reaction gets the accent tint. */
+@Composable
+private fun ReactionChipsRow(reactions: List<SonarReaction>, onReact: ((String) -> Unit)?) {
+    val s = sonar
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.padding(top = 3.dp, start = 4.dp, end = 4.dp)
+    ) {
+        reactions.forEach { r ->
+            Row(
+                Modifier.clip(RoundedCornerShape(11.dp))
+                    .background(if (r.mine) s.accentSoft else s.surface2)
+                    .then(if (onReact != null) Modifier.clickable { onReact(r.emoji) } else Modifier)
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(r.emoji, fontSize = 13.sp)
+                if (r.count > 1) {
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "${r.count}",
+                        color = if (r.mine) s.accentDeep else s.text2,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
     }
 }
 

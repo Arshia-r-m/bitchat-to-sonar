@@ -148,6 +148,9 @@ actual object SonarCore {
         requireNode().sendText(chatId, text)
     }
 
+    actual suspend fun toggleReaction(chatId: String, messageId: String, emoji: String) =
+        withContext(Dispatchers.IO) { requireNode().toggleReaction(chatId, messageId, emoji) }
+
     actual suspend fun sendMedia(
         chatId: String,
         data: ByteArray,
@@ -274,6 +277,7 @@ actual object SonarCore {
         stickerRef = stickerRef?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         },
+        reactions = reactions.map { SonarReaction(it.emoji, it.count.toInt(), it.mine) },
     )
 
     private fun uniffi.sonar_ffi.StickerPackInfo.toCommon(): SonarStickerPack = SonarStickerPack(

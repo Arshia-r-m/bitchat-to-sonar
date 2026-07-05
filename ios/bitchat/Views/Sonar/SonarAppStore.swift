@@ -333,6 +333,9 @@ struct SNMessage: Identifiable, Equatable {
     var media: [SNMediaItem] = []
     /// Non-nil = render as a sticker bubble instead of text.
     var stickerRef: MarmotService.MarmotStickerRef?
+    /// Aggregated emoji reactions (Marmot NIP-25 kind-7, or folded mesh
+    /// ⚡REACT lines). Non-empty ⇒ render a chip row under the bubble.
+    var reactions: [MessageReaction] = []
 }
 
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
@@ -3052,7 +3055,8 @@ final class SonarAppStore: ObservableObject {
         let now = Date()
         var byKey: [String: SNDMRow] = [:]
         for (peerID, msgs) in chatViewModel.privateChats where !msgs.isEmpty {
-            let row = meshRow(peerID: peerID, last: msgs.last)
+            // ⚡REACT control lines never drive the row preview/time.
+            let row = meshRow(peerID: peerID, last: msgs.last { !SonarReactionMessage.isReactionLine($0.content) })
             let key = canonicalPeerKey(peerID)
             if let existing = byKey[key],
                (existing.lastDate ?? .distantPast) >= (row.lastDate ?? .distantPast) {
@@ -3352,11 +3356,26 @@ final class SonarAppStore: ObservableObject {
                 ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
                 : groups
             var dated: [(Date, SNMessage)] = []
+            // Mesh reactions ride the Marmot fallback leg as ⚡REACT lines
+            // when the peer is out of BLE range: never render them as text —
+            // collect them and fold them into the mesh leg's aggregates.
+            var marmotReactionLines: [SonarReactionMessage.ExternalLine] = []
             for group in sourceGroups {
                 dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
                     // Drop a blocked person's messages from the transcript, the
                     // same way the mesh inbound path drops them via `isNostrBlocked`.
                     if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
+                    if SonarReactionMessage.isReactionLine(m.content) {
+                        if let line = SonarReactionMessage.decode(m.content) {
+                            marmotReactionLines.append(.init(
+                                date: m.createdAt,
+                                line: line,
+                                mine: m.isMine,
+                                senderKey: m.senderNpub
+                            ))
+                        }
+                        return nil
+                    }
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
@@ -3375,7 +3394,8 @@ final class SonarAppStore: ObservableObject {
                             via: .internet,
                             state: MarmotChatModel.stateText(for: m),
                             media: Self.mediaItems(m, groupId: group.id),
-                            stickerRef: m.stickerRef
+                            stickerRef: m.stickerRef,
+                            reactions: m.reactions
                         ))
                     }
                 }
@@ -3384,7 +3404,15 @@ final class SonarAppStore: ObservableObject {
                 let peerID = PeerID(str: id)
                 let via: SNVia = .mesh
                 let my = chatViewModel.meshService.myPeerID
-                dated += (chatViewModel.privateChats[peerID] ?? []).compactMap { m in
+                // Fold ⚡REACT control lines out of the rendered mesh leg and
+                // into each target message's reaction aggregate, including
+                // lines that arrived on the Marmot fallback leg above.
+                let meshLeg = SonarReactionMessage.fold(
+                    chatViewModel.privateChats[peerID] ?? [],
+                    myPeerID: my,
+                    externalLines: marmotReactionLines
+                )
+                dated += meshLeg.compactMap { m in
                     let mine = m.senderPeerID == my
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
@@ -3408,7 +3436,8 @@ final class SonarAppStore: ObservableObject {
                             via: via,
                             state: mine ? Self.stateText(m.deliveryStatus) : nil,
                             media: mediaItem.map { [$0] } ?? [],
-                            stickerRef: meshSticker
+                            stickerRef: meshSticker,
+                            reactions: m.reactions
                         ))
                     }
                 }
@@ -3435,7 +3464,28 @@ final class SonarAppStore: ObservableObject {
         let peerID = PeerID(str: id)
         let via = dmTransport(id)
         let my = chatViewModel.meshService.myPeerID
-        var dated: [(Date, SNMessage)] = (chatViewModel.privateChats[peerID] ?? []).compactMap { m in
+        // The Sonar peer's White Noise leg (out-of-BLE-range fallback) can carry
+        // ⚡REACT lines targeting mesh messages: collect them first so they fold
+        // onto the mesh transcript instead of rendering as raw text.
+        let sonarWnGroup = resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub) }
+        var marmotReactionLines: [SonarReactionMessage.ExternalLine] = []
+        if let group = sonarWnGroup {
+            for m in marmot.messagesByGroup[group.id] ?? [] {
+                guard SonarReactionMessage.isReactionLine(m.content),
+                      let line = SonarReactionMessage.decode(m.content) else { continue }
+                marmotReactionLines.append(.init(
+                    date: m.createdAt, line: line, mine: m.isMine, senderKey: m.senderNpub
+                ))
+            }
+        }
+        // Fold ⚡REACT control lines out of the rendered mesh transcript and
+        // into each target message's reaction aggregate.
+        let meshLeg = SonarReactionMessage.fold(
+            chatViewModel.privateChats[peerID] ?? [],
+            myPeerID: my,
+            externalLines: marmotReactionLines
+        )
+        var dated: [(Date, SNMessage)] = meshLeg.compactMap { m in
             let mine = m.senderPeerID == my
             switch payMapping(m.content, fallbackVia: via) {
             case .hidden:
@@ -3461,7 +3511,8 @@ final class SonarAppStore: ObservableObject {
                     via: via,
                     state: mine ? Self.stateText(m.deliveryStatus) : nil,
                     media: mediaItem.map { [$0] } ?? [],
-                    stickerRef: meshSticker
+                    stickerRef: meshSticker,
+                    reactions: m.reactions
                 ))
             }
         }
@@ -3469,11 +3520,13 @@ final class SonarAppStore: ObservableObject {
         // of Bluetooth range. v1 keeps the two transcripts in separate
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
-        if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
+        if let group = sonarWnGroup {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
                 // Drop a blocked person's messages from the transcript, the
                 // same way the mesh inbound path drops them via `isNostrBlocked`.
                 if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
+                // ⚡REACT lines were folded onto the mesh transcript above.
+                if SonarReactionMessage.isReactionLine(m.content) { return nil }
                 switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
@@ -3492,7 +3545,8 @@ final class SonarAppStore: ObservableObject {
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
                         media: Self.mediaItems(m, groupId: group.id),
-                        stickerRef: m.stickerRef
+                        stickerRef: m.stickerRef,
+                        reactions: m.reactions
                     ))
                 }
             }
@@ -3548,6 +3602,35 @@ final class SonarAppStore: ObservableObject {
             return
         }
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+    }
+
+    /// Toggle the local user's emoji reaction on a transcript message, routed
+    /// by which leg of the (possibly folded) conversation the message lives
+    /// in: a White Noise/Marmot message reacts with a real NIP-25 kind-7 event
+    /// through the core; a mesh/bitchat message reacts with a ⚡REACT control
+    /// line over the private-message path. Signal tapback semantics either way.
+    func toggleReaction(_ id: String, messageId: String, emoji: String) {
+        // Marmot legs: every group this chat can render (folded direct groups
+        // plus the Sonar-profile leg).
+        var candidateGroups: [MarmotService.MarmotGroup] = []
+        if let groupId = marmotGroupId(id) {
+            let groups = directMarmotGroups(matchingGroupId: groupId)
+            candidateGroups = groups.isEmpty
+                ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
+                : groups
+        }
+        if let profile = resolvedSonarProfile(id),
+           let group = marmotGroup(forNpub: profile.npub),
+           !candidateGroups.contains(where: { $0.id == group.id }) {
+            candidateGroups.append(group)
+        }
+        for group in candidateGroups
+        where marmot.messagesByGroup[group.id]?.contains(where: { $0.id == messageId }) == true {
+            marmot.toggleReaction(groupId: group.id, messageId: messageId, emoji: emoji)
+            return
+        }
+        // Mesh leg (validated against the stored transcript inside).
+        chatViewModel.toggleReaction(peerID: PeerID(str: id), messageId: messageId, emoji: emoji)
     }
 
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
@@ -4888,6 +4971,11 @@ final class SonarAppStore: ObservableObject {
         if stickerRef != nil { return "Sticker" }
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
+        }
+        // Defensive: reaction control lines are filtered out of preview
+        // selection upstream, but never let one leak into a list row.
+        if let react = SonarReactionMessage.decode(content) {
+            return "Reacted \(react.emoji)"
         }
         return SonarPayMessage.decode(content) != nil ? "\u{20BF} Payment" : content
     }
