@@ -1671,6 +1671,11 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        // A mesh-referencing reaction riding this leg as a ⚡REACT control
+        // line is a reaction, not user text: it must not clobber the sender's
+        // chat-list preview and must not fire a "new message" push wakeup
+        // (mirrors the receive-side drain special-case).
+        let is_mesh_reaction_line = text.starts_with(MESH_REACTION_LINE_PREFIX);
         let event = self.engine.create_text_message(group_id, text)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1684,6 +1689,10 @@ impl SonarClient {
         let event_id = event.id;
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
+        if is_mesh_reaction_line {
+            self.spawn_reaction_bookkeeping(event_id);
+            return Ok(());
+        }
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
@@ -1864,7 +1873,10 @@ impl SonarClient {
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_reaction_bookkeeping(event_id);
-        self.spawn_push_notification(group_id.clone());
+        // No push wakeup: a tapback must never render as a "new message"
+        // alert on the peer (reaction notifications are a tracked follow-up);
+        // online peers get it via the live 445 subscription, offline peers on
+        // their next sync.
         Ok(())
     }
 
