@@ -266,6 +266,21 @@ final class MarmotChatModel: ObservableObject {
             }
     }
 
+    // MARK: - Typing indicators (ephemeral pass-through to the core)
+
+    /// (groupIdHex, typing) changes from the core typing listener.
+    var typingChanged: AnyPublisher<(String, Bool), Never> {
+        service.typingChanged.eraseToAnyPublisher()
+    }
+
+    func notifyTyping(groupId: String) {
+        service.notifyTyping(groupId: groupId)
+    }
+
+    func notifyTypingStopped(groupId: String) {
+        service.notifyTypingStopped(groupId: groupId)
+    }
+
     /// Connect on first appearance: reuse the keychain identity if present.
     /// A fresh identity may be created only by explicit onboarding completion.
     /// Publishes our KeyPackage so White Noise users can start chats with us.

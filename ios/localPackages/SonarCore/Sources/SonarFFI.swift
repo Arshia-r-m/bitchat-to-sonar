@@ -969,6 +969,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     
     func clearConversationChangeListener() 
     
+    func clearTypingChangeListener() 
+    
     func conversationSummaries()  -> [ConversationSummaryInfo]
     
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
@@ -1080,6 +1082,20 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * rows such as commits/proposals are skipped by the core.
      */
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
+    
+    /**
+     * Local composer produced input for this chat. Cheap and non-blocking
+     * (a channel send into the core typing task); safe to call per keystroke.
+     * The core owns the Signal cadence: STARTED once, refresh every 10s,
+     * STOPPED after 3s idle or on send.
+     */
+    func notifyTyping(groupIdHex: String) throws 
+    
+    /**
+     * Local composer cleared / chat closed. Publishes STOPPED only if a
+     * STARTED is outstanding.
+     */
+    func notifyTypingStopped(groupIdHex: String) throws 
     
     /**
      * Pending multi-member group invites awaiting accept/decline.
@@ -1195,7 +1211,23 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func sendText(groupIdHex: String, text: String) throws 
     
+    /**
+     * Lifecycle invariant (repeat installs are leak-free): each call spawns a
+     * fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+     * replaces the core listener Arc, which drops the previous `tx`; that
+     * closes the old channel and the old thread exits its recv loop. Do NOT
+     * cache the core listener Arc anywhere else — a retained `tx` would keep
+     * the orphaned thread alive forever.
+     */
     func setConversationChangeListener(listener: ConversationChangeListener) 
+    
+    /**
+     * Same forwarder-thread lifecycle invariant as
+     * [`Self::set_conversation_change_listener`]: the old thread exits when
+     * its `tx` drops on listener replacement — never retain the core
+     * listener Arc outside the client.
+     */
+    func setTypingChangeListener(listener: TypingChangeListener) 
     
     /**
      * Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their
@@ -1503,6 +1535,13 @@ open func clearConversationChangeListener()  {try! rustCall() {
 }
 }
     
+open func clearTypingChangeListener()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_clear_typing_change_listener(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
 open func conversationSummaries() -> [ConversationSummaryInfo]  {
     return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
@@ -1784,6 +1823,32 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
 }
     
     /**
+     * Local composer produced input for this chat. Cheap and non-blocking
+     * (a channel send into the core typing task); safe to call per keystroke.
+     * The core owns the Signal cadence: STARTED once, refresh every 10s,
+     * STOPPED after 3s idle or on send.
+     */
+open func notifyTyping(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_notify_typing(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+    
+    /**
+     * Local composer cleared / chat closed. Publishes STOPPED only if a
+     * STARTED is outstanding.
+     */
+open func notifyTypingStopped(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_notify_typing_stopped(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+    
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
 open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
@@ -2043,10 +2108,32 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
 }
 }
     
+    /**
+     * Lifecycle invariant (repeat installs are leak-free): each call spawns a
+     * fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+     * replaces the core listener Arc, which drops the previous `tx`; that
+     * closes the old channel and the old thread exits its recv loop. Do NOT
+     * cache the core listener Arc anywhere else — a retained `tx` would keep
+     * the orphaned thread alive forever.
+     */
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_set_conversation_change_listener(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceConversationChangeListener_lower(listener),$0
+    )
+}
+}
+    
+    /**
+     * Same forwarder-thread lifecycle invariant as
+     * [`Self::set_conversation_change_listener`]: the old thread exits when
+     * its `tx` drops on listener replacement — never retain the core
+     * listener Arc outside the client.
+     */
+open func setTypingChangeListener(listener: TypingChangeListener)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_set_typing_change_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceTypingChangeListener_lower(listener),$0
     )
 }
 }
@@ -4898,6 +4985,145 @@ public func FfiConverterCallbackInterfaceConversationChangeListener_lower(_ v: C
     return FfiConverterCallbackInterfaceConversationChangeListener.lower(v)
 }
 
+
+
+
+/**
+ * Callback interface for ephemeral typing indicators. `typing=true` when a
+ * remote member starts composing in the group, `false` when they stop, send,
+ * or the 15s expiry lapses without a refresh. Purely in-memory state: typing
+ * never touches the transcript, the conversation index, or unread counts.
+ */
+public protocol TypingChangeListener: AnyObject, Sendable {
+    
+    func onTypingChanged(groupIdHex: String, typing: Bool) 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceTypingChangeListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceTypingChangeListener = UniffiVTableCallbackInterfaceTypingChangeListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceTypingChangeListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface TypingChangeListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceTypingChangeListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface TypingChangeListener: handle missing in uniffiClone")
+            }
+        },
+        onTypingChanged: { (
+            uniffiHandle: UInt64,
+            groupIdHex: RustBuffer,
+            typing: Int8,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceTypingChangeListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onTypingChanged(
+                     groupIdHex: try FfiConverterString.lift(groupIdHex),
+                     typing: try FfiConverterBool.lift(typing)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceTypingChangeListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceTypingChangeListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitTypingChangeListener() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_typingchangelistener(UniffiCallbackInterfaceTypingChangeListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceTypingChangeListener {
+    fileprivate static let handleMap = UniffiHandleMap<TypingChangeListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceTypingChangeListener : FfiConverter {
+    typealias SwiftType = TypingChangeListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceTypingChangeListener_lift(_ handle: UInt64) throws -> TypingChangeListener {
+    return try FfiConverterCallbackInterfaceTypingChangeListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceTypingChangeListener_lower(_ v: TypingChangeListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceTypingChangeListener.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -6091,6 +6317,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_conversation_change_listener() != 59668) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_typing_change_listener() != 61017) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6163,6 +6392,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_notify_typing() != 37601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_notify_typing_stopped() != 31471) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6223,7 +6458,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 6720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_typing_change_listener() != 14877) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_dm() != 11780) {
@@ -6289,8 +6527,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_typingchangelistener_on_typing_changed() != 39997) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
     uniffiCallbackInitConversationChangeListener()
+    uniffiCallbackInitTypingChangeListener()
     return InitializationResult.ok
 }()
 

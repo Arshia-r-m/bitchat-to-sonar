@@ -646,6 +646,8 @@ pub struct SonarClient {
     push_token_cache_path: Option<PathBuf>,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// Ephemeral typing-indicator state machine (kind-20445; never persisted).
+    typing: crate::typing::TypingManager,
 }
 
 impl SonarClient {
@@ -808,12 +810,20 @@ impl SonarClient {
         let initial_group_message_catchup_scanned = Arc::new(AtomicBool::new(false));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
 
+        let typing = crate::typing::TypingManager::spawn(
+            Arc::new(crate::typing::NostrTypingPublisher {
+                nostr: nostr.clone(),
+            }),
+            crate::typing::TypingConfig::default(),
+        );
+
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
         let handler_presence = geo_presence.clone();
         let handler_subs = geo_subscribed.clone();
         let handler_pending = pending_marmot.clone();
         let handler_notify = marmot_notify.clone();
+        let handler_typing = typing.clone();
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
         let my_pubkey_hex = identity.keys().public_key().to_hex();
@@ -853,7 +863,10 @@ impl SonarClient {
                     _ => continue,
                 };
                 let kind = event.kind.as_u16();
-                if !matches!(kind, 20000 | 20001 | 1059 | 445) {
+                if !matches!(
+                    kind,
+                    20000 | 20001 | crate::typing::TYPING_EVENT_KIND | 1059 | 445
+                ) {
                     continue;
                 }
                 if !live_dedup.should_accept(&event.id, Instant::now()) {
@@ -1007,6 +1020,13 @@ impl SonarClient {
                         }
                         handler_notify.notify_one();
                     }
+                    crate::typing::TYPING_EVENT_KIND => {
+                        // Ephemeral typing indicator for a subscribed group.
+                        // Handled entirely in memory — never buffered for the
+                        // MLS engine, never persisted, never advances sync
+                        // state (mirrors the geohash presence path above).
+                        handler_typing.handle_remote_event(&event);
+                    }
                     _ => {}
                 }
             }
@@ -1058,7 +1078,11 @@ impl SonarClient {
             push_token_cache,
             push_token_cache_path,
             own_push_registration: Arc::new(Mutex::new(None)),
+            typing,
         };
+        // Seed the typing manager's group-id mapping so incoming indicators
+        // resolve even before the first live (re)subscription.
+        client.refresh_typing_groups();
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
         // the e2e tests remain deterministic and network-shaped.
@@ -1666,6 +1690,9 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        // Sending a message implies typing stopped (Signal sends STOPPED on
+        // send rather than waiting out the pause timer).
+        self.notify_typing_stopped(group_id);
         let event = self.engine.create_text_message(group_id, text)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1805,6 +1832,7 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+        self.notify_typing_stopped(group_id);
         let event = self.engine.create_sticker_message(group_id, sticker_ref)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -2024,6 +2052,7 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
+        self.notify_typing_stopped(group_id);
         let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
         let url = self
             .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
@@ -2324,11 +2353,21 @@ impl SonarClient {
             }
         }
 
+        // Keep the typing manager's group mapping in step with the live
+        // subscription set (typing events arrive tagged with the nostr group
+        // id but are reported to hosts keyed by the MLS group id).
+        self.refresh_typing_groups();
+
         let since_secs = self.sync_watermark_secs();
         let mut group_id_list: Vec<String> = group_ids.iter().cloned().collect();
         group_id_list.sort();
+        // Kind 20445 rides the same `#h` filter: ephemeral typing indicators.
+        // Relays never store ephemeral kinds, so `since` only affects 445s.
         let mut filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
+            .kinds([
+                Kind::MlsGroupMessage,
+                Kind::Custom(crate::typing::TYPING_EVENT_KIND),
+            ])
             .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list);
         if since_secs > 0 {
             filter = filter.since(Timestamp::from_secs(
@@ -3162,6 +3201,54 @@ impl SonarClient {
         listener: Option<Arc<dyn ConversationChangeListener>>,
     ) {
         *self.change_listener.lock().unwrap() = listener;
+    }
+
+    // ── Typing indicators (ephemeral kind-20445; see crate::typing) ───────
+
+    pub fn set_typing_listener(&self, listener: Option<Arc<dyn crate::typing::TypingListener>>) {
+        self.typing.set_listener(listener);
+    }
+
+    /// Local composer produced input for this group. Cheap and non-blocking
+    /// (a channel send); the publish/refresh cadence runs on the typing
+    /// manager's own task, so callers can invoke this per keystroke.
+    pub fn notify_typing(&self, group_id: &GroupId) {
+        if let Some((mls_hex, nostr_hex)) = self.typing_ids(group_id) {
+            self.typing.local_typing(mls_hex, nostr_hex);
+        }
+    }
+
+    /// Local composer went idle/cleared or the chat closed. Publishes a
+    /// STOPPED only if a STARTED is outstanding.
+    pub fn notify_typing_stopped(&self, group_id: &GroupId) {
+        if let Some((mls_hex, nostr_hex)) = self.typing_ids(group_id) {
+            self.typing.local_stopped(mls_hex, nostr_hex);
+        }
+    }
+
+    /// Re-derive the mls↔nostr group-id mapping the typing manager uses to
+    /// route indicators. Cheap (one engine group enumeration); called on
+    /// connect and whenever the live group subscription set changes.
+    pub fn refresh_typing_groups(&self) {
+        if let Ok(groups) = self.engine.groups() {
+            self.typing.update_groups(groups.into_iter().map(|g| {
+                (
+                    hex::encode(g.mls_group_id.as_slice()),
+                    hex::encode(g.nostr_group_id),
+                )
+            }));
+        }
+    }
+
+    fn typing_ids(&self, group_id: &GroupId) -> Option<(String, String)> {
+        let mls_hex = hex::encode(group_id.as_slice());
+        if let Some(nostr_hex) = self.typing.nostr_hex_for_mls(&mls_hex) {
+            return Some((mls_hex, nostr_hex));
+        }
+        // Cache miss (e.g. a group joined since the last refresh): re-derive.
+        self.refresh_typing_groups();
+        let nostr_hex = self.typing.nostr_hex_for_mls(&mls_hex)?;
+        Some((mls_hex, nostr_hex))
     }
 
     pub fn conversation_summaries(&self) -> Vec<ConversationSummary> {
