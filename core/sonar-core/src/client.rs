@@ -1299,11 +1299,17 @@ impl SonarClient {
 
     /// Set the advertised Marmot protocol capability. A Darkmatter-capable build
     /// calls this with [`crate::sonar_descriptor::SONAR_PROTOCOL_DARKMATTER`] when
-    /// the experimental dev toggle is on, then republishes the descriptor so peers
-    /// can negotiate v2 for NEW conversations. Existing conversations are unaffected.
+    /// the experimental dev toggle is on. Existing conversations are unaffected.
+    ///
+    /// This does NOT republish anything: the value only reaches peers on the
+    /// next [`SonarClient::publish_sonar_descriptor`], so a toggle flow must be
+    /// set-then-publish. The value is floored to `SONAR_PROTOCOL_MDK` — every
+    /// build speaks at least MDK, and `negotiate` relies on inputs >= 1.
     pub fn set_advertised_sonar_protocol(&self, protocol: u8) {
-        self.advertised_sonar_protocol
-            .store(protocol, Ordering::Relaxed);
+        self.advertised_sonar_protocol.store(
+            protocol.max(crate::sonar_descriptor::SONAR_PROTOCOL_MDK),
+            Ordering::Relaxed,
+        );
     }
 
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
@@ -4225,8 +4231,12 @@ mod tests {
             &keys,
             SONAR_CALL_DESCRIPTOR_D_TAG,
             20,
-            descriptor_content_json(true, vec!["marmot".to_string()])
-                .expect("call descriptor json"),
+            descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("call descriptor json"),
         );
 
         let descriptor = newest_valid_sonar_descriptor([old_meta, new_call], keys.public_key())
@@ -4272,8 +4282,12 @@ mod tests {
             &keys,
             SONAR_CALL_DESCRIPTOR_D_TAG,
             30,
-            descriptor_content_json(true, vec!["marmot".to_string()])
-                .expect("call descriptor json"),
+            descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("call descriptor json"),
         );
 
         let descriptor =
@@ -4283,6 +4297,61 @@ mod tests {
         assert_eq!(descriptor.published_at_secs, 30);
         assert!(descriptor.bolt12_offer.is_none());
         assert!(descriptor.payment_receipts.is_empty());
+    }
+
+    #[test]
+    fn newest_valid_sonar_descriptor_keeps_protocol_from_freshest_call_publish() {
+        use crate::sonar_descriptor::{SONAR_PROTOCOL_DARKMATTER, SONAR_PROTOCOL_MDK};
+
+        // Regression: a fresher call-only republish (routine for wallet-less
+        // users since #180 gates the meta on an offer) must not drop the
+        // peer's Darkmatter claim. Both descriptors carry `sonar_protocol`,
+        // so the freshest event always states the capability — while the
+        // offer is still backfilled from the freshest meta.
+        let keys = Keys::generate();
+        let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq";
+        let old_meta = signed_descriptor_event(
+            &keys,
+            SONAR_META_DESCRIPTOR_D_TAG,
+            10,
+            meta_descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                Some(offer.to_string()),
+                SONAR_PROTOCOL_DARKMATTER,
+            )
+            .expect("meta descriptor json"),
+        );
+        let fresh_call = signed_descriptor_event(
+            &keys,
+            SONAR_CALL_DESCRIPTOR_D_TAG,
+            20,
+            descriptor_content_json(true, vec!["marmot".to_string()], SONAR_PROTOCOL_DARKMATTER)
+                .expect("call descriptor json"),
+        );
+
+        let descriptor =
+            newest_valid_sonar_descriptor([old_meta.clone(), fresh_call], keys.public_key())
+                .expect("freshest descriptor");
+        assert_eq!(descriptor.published_at_secs, 20);
+        assert_eq!(descriptor.sonar_protocol, SONAR_PROTOCOL_DARKMATTER);
+        // Offer backfill from the freshest meta still applies.
+        assert_eq!(descriptor.bolt12_offer.as_deref(), Some(offer));
+
+        // A downgraded install (old build, no `sonar_protocol` field) that
+        // republishes later legitimately drops the claim back to MDK.
+        let downgraded_call = signed_descriptor_event(
+            &keys,
+            SONAR_CALL_DESCRIPTOR_D_TAG,
+            30,
+            descriptor_content_json(true, vec!["marmot".to_string()], SONAR_PROTOCOL_MDK)
+                .expect("call descriptor json"),
+        );
+        let descriptor =
+            newest_valid_sonar_descriptor([old_meta, downgraded_call], keys.public_key())
+                .expect("freshest descriptor");
+        assert_eq!(descriptor.published_at_secs, 30);
+        assert_eq!(descriptor.sonar_protocol, SONAR_PROTOCOL_MDK);
     }
 
     #[test]
