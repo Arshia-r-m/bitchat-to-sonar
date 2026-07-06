@@ -539,6 +539,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
+    private var marmotWakeJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
      *  the [housekeepingTrigger] channel conflates bursts into one pass. */
@@ -2681,6 +2682,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // an incoming call rings without us having to place one first.
                 launch { ensureCallStarted() }
                 startMeshRealtimeLoop()
+                startMarmotWakeLoop()
                 poll()
                 // Run the first housekeeping pass now instead of waiting a full
                 // heartbeat — seeds notifications/unread/profiles at launch (the
@@ -5692,6 +5694,28 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  signal: presence, BLE policy, unify, profile TTLs). Message delivery /
      *  call ringing / pay processing for the changed chat stay on the prompt
      *  `conversationChanged` path in [collectConversationChanges]. */
+    /** Signal-style event-driven receive (iOS `startPolling` parity): park on
+     *  the core's live-event buffer and drain the instant a 445 lands, instead
+     *  of leaving buffered events to the 30/60 s heartbeat `sync()`. Repaint and
+     *  notifications ride the conversation-changed listener like every other
+     *  local-DB change; this loop never touches UI state itself. */
+    private fun startMarmotWakeLoop() {
+        if (marmotWakeJob?.isActive == true) return
+        marmotWakeJob = scope.launch {
+            while (true) {
+                val woke = SonarCore.waitForMarmotEvent(25L)
+                if (woke) {
+                    SonarCore.drainPendingMarmot()
+                } else {
+                    // Idle timeout (or node unavailable, which returns false
+                    // without parking): floor the loop so it can never spin
+                    // hot. Subscription self-heal stays the heartbeat's job.
+                    delay(1_000)
+                }
+            }
+        }
+    }
+
     private fun poll() {
         if (pollJob?.isActive == true) return
         startHousekeepingConsumer()

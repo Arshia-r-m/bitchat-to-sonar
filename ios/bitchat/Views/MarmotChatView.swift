@@ -260,9 +260,17 @@ final class MarmotChatModel: ObservableObject {
         self.conversationChangeSub = service.conversationChanged
             .receive(on: DispatchQueue.main)
             .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] groupId in
                 guard let self else { return }
-                Task { await self.loadLocalSummaries(resolveMembers: false) }
+                Task {
+                    await self.loadLocalSummaries(resolveMembers: false)
+                    // The summary merge only refreshes the newest window; a
+                    // change touching older loaded rows (e.g. a reaction to an
+                    // old message) needs the full bounded page for that group.
+                    if (self.messagesByGroup[groupId]?.count ?? 0) > Int(Self.localSummaryPageLimit) {
+                        await self.loadLocalPage(groupId: groupId)
+                    }
+                }
             }
     }
 

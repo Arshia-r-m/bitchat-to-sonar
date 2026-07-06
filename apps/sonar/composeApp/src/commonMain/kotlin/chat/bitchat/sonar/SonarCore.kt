@@ -529,6 +529,15 @@ expect object SonarCore {
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
 
+    /** Park until a live Marmot event is buffered (or `timeoutSecs` elapses).
+     *  Returns true when there is something to drain. Blocking FFI wait — call
+     *  only from the dedicated wake loop; it touches no engine state. */
+    suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean
+
+    /** Process every buffered live Marmot event through the MLS engine. UI
+     *  updates ride the conversation-changed listener, not the return value. */
+    suspend fun drainPendingMarmot()
+
     /** Re-subscribe with current watermark + group set to self-heal after
      *  relay disconnects. May perform one bounded chat repair fetch; call from
      *  background/IO work and never before local chat paint. */

@@ -357,6 +357,15 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean = withContext(Dispatchers.IO) {
+        runCatching { node?.waitForMarmotEvent(timeoutSecs.toULong()) }.getOrNull() ?: false
+    }
+
+    actual suspend fun drainPendingMarmot() = withContext(Dispatchers.IO) {
+        runCatching { node?.drainPendingMarmot() }
+        Unit
+    }
+
     // ── Diagnostics (Settings → Diagnostics) ──
 
     private fun coreLogDirectory(): File =
