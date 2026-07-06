@@ -1733,6 +1733,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     var payVersion by mutableStateOf(0)
         private set
 
+    /** Bumped when the open chat's BLE Noise link forms or drops, so the DM
+     *  header/banner/composer recompose promptly instead of waiting for an
+     *  unrelated state change ([dmInRange] reads non-snapshot radio state). */
+    var meshLinkVersion by mutableStateOf(0)
+        private set
+
     fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
 
     fun walletPayEntries(): List<PayEntry> = payLedger.all()
@@ -1861,9 +1867,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isContactBlocked(chatId)) return false
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            if (hasLiveMeshRoute(peerId)) {
-                return clean.all { sendMesh(peerId, it) }
-            }
+            // Receipt lines are idempotent by pay uuid, so a partial mesh send
+            // can safely re-send the full set over White Noise below.
+            if (hasLiveMeshRoute(peerId) && clean.all { sendMesh(peerId, it) }) return true
             val raw = npubRawFor(peerId) ?: return false
             return sendPaymentReceiptLinesOverMarmot(
                 ensureMarmotGroupForOutbox(peerId, raw) ?: return false,
@@ -3952,7 +3958,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
             if (sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
-            if (resolveMarmotGroupId(chatId) == null) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                toast = "Not connected over Bluetooth yet — stay close and try again"
+                return
+            }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
@@ -4142,7 +4151,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mime = "audio/mp4"
         if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
             if (sendMeshMedia(meshPeerId(chatId), bytes, filename, mime)) return
-            if (resolveMarmotGroupId(chatId) == null) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                toast = "Not connected over Bluetooth yet — stay close and try again"
+                return
+            }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
@@ -4213,7 +4225,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
             val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-            if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, content); return }
+            if (MeshRadio.hasMeshLink(peerId) && sendMesh(peerId, content)) return
             val raw = npubRawFor(peerId)
             if (raw != null) {
                 when {
@@ -4340,7 +4352,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Message queued and will send in order."
             return
         }
-        if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
+        // The link can die between the gate and the actual GATT write — fall
+        // through to the White Noise / NIP-17 / outbox routing on failure
+        // instead of dropping the message.
+        if (MeshRadio.hasMeshLink(peerId) && sendMesh(peerId, text)) return
         val raw = npubRawFor(peerId)
         if (raw != null) {
             when {
@@ -4421,8 +4436,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             return false
         }
         val mid = randomMeshId()
-        val ok = MeshRadio.sendMeshDm(peerId, mid, text)
-        if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
+        // An honest failure (no writable Noise route right now) returns false so
+        // the caller can fall back to White Noise / the outbox instead of
+        // rendering a phantom "sent over mesh" bubble.
+        if (!MeshRadio.sendMeshDm(peerId, mid, text)) return false
         val stickerRef = meshParseStickerContent(text)?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         }
@@ -4442,11 +4459,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val mid = randomMeshId()
         val mediaUrl = meshMediaUrl(peerId, mid, filename)
-        val ok = MeshRadio.sendMeshMedia(peerId, mid, data, filename, mime)
-        if (!ok) {
-            toast = "Not connected over Bluetooth yet — stay close and try again"
-            return false
-        }
+        // Honest failure: callers fall back to the White Noise upload path (or
+        // surface their own guidance when no fallback exists).
+        if (!MeshRadio.sendMeshMedia(peerId, mid, data, filename, mime)) return false
         val media = SonarMedia(mediaUrl, mime, filename, null, null, null)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
@@ -5212,11 +5227,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun observedMeshPeer(peerId: String): Boolean =
-        peerId in rawMeshPeerIds
-
+    /** True while a live, writable Noise link to [peerId] exists — the exact
+     *  condition the send path uses, and iOS parity (`meshReachable` is
+     *  connection-based). It must NOT additionally require membership in the
+     *  announce-derived `rawMeshPeerIds` set: that set refreshes only on the
+     *  housekeeping cadence, and the mismatch made the chat header claim
+     *  "Out of Bluetooth range — encrypted over the internet instead" while
+     *  messages were actually flowing over BLE. */
     private fun hasLiveMeshRoute(peerId: String): Boolean =
-        observedMeshPeer(peerId) && MeshRadio.hasMeshLink(peerId)
+        MeshRadio.hasMeshLink(peerId)
 
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
     fun dmInRange(peerId: String): Boolean = hasLiveMeshRoute(peerId)
@@ -6005,12 +6024,31 @@ class SonarAppState(private val scope: CoroutineScope) {
             // calls/sec burn CPU draining empty queues forever. Idle backs
             // off to 1s; any drain hit or in-range peer snaps back to 150ms.
             var lastActivityMs = 0L
+            // Open-chat link watch: peerId → last observed hasMeshLink, so a
+            // link forming/dropping mid-conversation updates the transport
+            // header/banner within a tick and flushes queued sends on re-link.
+            var watchedPeerId: String? = null
+            var watchedLinkUp = false
             while (true) {
                 val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // hasActivePeer() is a cheap link/announce probe — unlike
                 // peers() it doesn't build+sort the whole list every tick.
                 if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
+                val openPeerId = (screen as? Screen.Chat)?.id
+                    ?.takeIf { isMeshChat(it) }?.let { meshPeerId(it) }
+                val linkUp = openPeerId != null && MeshRadio.hasMeshLink(openPeerId)
+                if (openPeerId != watchedPeerId) {
+                    watchedPeerId = openPeerId
+                    watchedLinkUp = linkUp
+                } else if (openPeerId != null && linkUp != watchedLinkUp) {
+                    watchedLinkUp = linkUp
+                    meshLinkVersion++
+                    if (linkUp) {
+                        flushOutbox(openPeerId)
+                        lastActivityMs = nowMs
+                    }
+                }
                 val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
                 delay(if (fast) 150 else 1000)
             }

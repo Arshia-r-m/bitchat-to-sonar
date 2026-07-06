@@ -316,7 +316,6 @@ object MeshGatt {
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
         fingerprintByPeerId.clear(); recentDials.clear()
         pendingSonarByAddr.clear()
-        pendingSends.clear()
         seenFileIds.clear()
     }
 
@@ -790,7 +789,6 @@ object MeshGatt {
         }
         android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=${peerIdByAddr[addr]} fp=${fp.take(8)}…)")
         onLink.forEach { it(fp) }
-        flushPending(fp)
     }
 
     private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray {
@@ -886,12 +884,6 @@ object MeshGatt {
         false
     }
 
-    /** DMs queued for a peer that has no live link yet, flushed when one forms.
-     *  Mesh links are intermittent (BLE MAC rotation + scanner stalls), so a peer
-     *  can be visible on the radar without a live encrypted link this instant —
-     *  queue the message instead of failing, and deliver it on (re)connect. */
-    private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
-
     private fun canSendOnAddr(addr: String): Boolean =
         (clientLinks[addr]?.established == true && clientGatt[addr] != null && clientChar[addr] != null) ||
             (serverLinks[addr]?.established == true && serverDevices[addr] != null)
@@ -908,16 +900,15 @@ object MeshGatt {
         }
 
     /** Send a DM addressed by the peer's stable fingerprint (the radar/UI key).
-     *  Sends immediately over a live Noise link, else QUEUES it to deliver when a
-     *  link (re)establishes. Returns true for policy-allowed peers because the
-     *  UI echoes optimistically; policy-rejected peers fail instead of creating
-     *  pending work. */
+     *  Returns true only when the message was actually written to a live Noise
+     *  route. There is deliberately NO hidden queue here: a queued-but-unsent
+     *  text rendered as "sent over mesh" and was never re-routed when the
+     *  conversation continued over White Noise — the app-level outbox owns
+     *  retry/fallback and needs an honest failure to do so. */
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
         if (!peerAllowedByPolicy(fingerprint)) return false
-        val addr = sendableAddrFor(fingerprint)
-        if (addr != null && sendText(addr, messageId, text)) return true
-        pendingSends.getOrPut(fingerprint) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
-        return true
+        val addr = sendableAddrFor(fingerprint) ?: return false
+        return sendText(addr, messageId, text)
     }
 
     /** Immediate send for real-time controls. Never queues. */
@@ -951,18 +942,6 @@ object MeshGatt {
     }.getOrElse {
         android.util.Log.w(TAG, "sendFile failed for $peerAddress: ${it.message}")
         false
-    }
-
-    /** Flush any queued DMs to [fingerprint] now that an encrypted link is up. */
-    private fun flushPending(fingerprint: String) {
-        val q = pendingSends[fingerprint] ?: return
-        while (true) {
-            val (mid, txt) = q.poll() ?: break
-            if (!sendTextToPeerNow(fingerprint, mid, txt)) {
-                q.add(mid to txt)
-                break
-            }
-        }
     }
 
     /** True iff there is an established encrypted route we can write to right now. */
