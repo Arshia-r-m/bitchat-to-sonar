@@ -96,6 +96,13 @@ object MeshLink {
         }
         val now = System.currentTimeMillis()
         seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
+        // Desktop gets NO BLE disconnect callback (bluster stubs CoreBluetooth's,
+        // see handleHandshake), so an established Noise session never learns the
+        // phone left range. Drop sessions whose peer aged out of seenByFp — else
+        // hasLink() reports a zombie link forever, dmInRange keeps the chat on
+        // "Bluetooth", and sendDm notifies into the void (returns true) instead of
+        // falling back to White Noise.
+        sessions.keys.retainAll(seenByFp.keys)
         // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
         // range stops being reported as a live Sonar user by [sonarPeers].
         sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
@@ -170,7 +177,19 @@ object MeshLink {
         touch(fp)
     }
 
-    fun hasLink(fp: String): Boolean = sessions[fp]?.established == true
+    /** True only for an established session whose peer is still fresh. The
+     *  freshness gate is what makes desktop reachability honest: there is no BLE
+     *  disconnect callback (bluster stubs it), so without the [seenByFp] TTL an
+     *  established session would report "in range" forever after the phone left,
+     *  and [dmInRange] would keep echoing DMs as mesh-sent instead of falling
+     *  back to White Noise. `seenByFp` is touched by every announce/0x53/DM/
+     *  handshake, so a connected phone stays fresh well inside [PEER_TTL_MS]. */
+    fun hasLink(fp: String): Boolean {
+        val s = sessions[fp] ?: return false
+        if (!s.established) return false
+        val seen = seenByFp[fp] ?: return false
+        return System.currentTimeMillis() - seen < PEER_TTL_MS
+    }
 
     fun sendDm(fp: String, messageId: String, text: String): Boolean {
         // No hidden queue: report failure honestly so the app-level outbox can
