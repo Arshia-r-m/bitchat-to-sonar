@@ -458,6 +458,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
+            marmotWakeJob?.cancel(); marmotWakeJob = null
         }
     }
 
@@ -2207,6 +2208,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
                 pollJob?.cancel(); pollJob = null
+                marmotWakeJob?.cancel(); marmotWakeJob = null
                 resetCallState()
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()

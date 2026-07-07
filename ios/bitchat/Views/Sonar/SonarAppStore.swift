@@ -2812,7 +2812,11 @@ final class SonarAppStore: ObservableObject {
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            guard let message = marmot.messagesByGroup[group.id]?.last else { continue }
+            // ⚡REACT fallback lines are reactions, not chat messages: they
+            // never drive the row preview or its timestamp.
+            guard let message = marmot.messagesByGroup[group.id]?
+                .last(where: { !SonarReactionMessage.isReactionLine($0.content) })
+            else { continue }
             if latest == nil || message.createdAt > latest!.message.createdAt {
                 latest = (group.id, message)
             }

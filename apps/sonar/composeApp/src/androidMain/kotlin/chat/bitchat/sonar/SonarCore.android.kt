@@ -344,8 +344,15 @@ actual object SonarCore {
     // socket was torn down while backgrounded. syncForce() bypasses the
     // short-circuit so the missed-while-backgrounded window is fetched
     // deterministically. Mirrors the iOS fix in MarmotChatView.refresh().
+    /** Serializes the engine-MUTATING relay calls (sync + drain both run
+     *  `process_marmot_events`), mirroring the iOS serialized engine queue.
+     *  `waitForMarmotEvent` deliberately stays OUTSIDE this lock: it is the
+     *  one park-only call documented as safe off the engine queue, and taking
+     *  the lock there would stall syncs for up to the 25 s park. */
+    private val engineSync = Mutex()
+
     actual suspend fun sync() = withContext(Dispatchers.IO) {
-        runCatching { node?.syncForce() }
+        engineSync.withLock { runCatching { node?.syncForce() } }
         Unit
     }
 
@@ -359,7 +366,7 @@ actual object SonarCore {
     }
 
     actual suspend fun drainPendingMarmot() = withContext(Dispatchers.IO) {
-        runCatching { node?.drainPendingMarmot() }
+        engineSync.withLock { runCatching { node?.drainPendingMarmot() } }
         Unit
     }
 
