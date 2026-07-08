@@ -114,10 +114,14 @@ object MeshLink {
         // dropped inbound phone→desktop DMs (handleEncrypted bails when
         // sessions[fp] is gone) while the phone still believed the link was up.
         // Freshness now gates only REACHABILITY (hasLink / sendDm / sendDmNow via
-        // [isFresh]), so a stale peer stops being reported in-range and outbound
-        // sends fall back to White Noise — but the crypto session survives so an
-        // inbound DM still decrypts (and its touch() revives freshness). The
-        // session is torn down only by re-handshake, decrypt failure, or wipe.
+        // [freshSession]), so a stale peer stops being reported in-range and
+        // outbound sends fall back to White Noise — but the crypto session
+        // survives so an inbound DM still decrypts (and its touch() revives
+        // freshness). A session is replaced only by a fresh re-handshake and
+        // cleared only by handshake failure or wipe(); it is intentionally NOT
+        // pruned on this TTL, so a long-lived desktop keeps one small session per
+        // historical peer (bounded by real contacts — a slow non-crypto-fatal
+        // growth we accept over risking the dropped-inbound bug above).
         // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
         // range stops being reported as a live Sonar user by [sonarPeers].
         sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }

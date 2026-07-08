@@ -4921,6 +4921,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         queued: QueuedMessage,
     ): Boolean {
         if (socialState.isBlockedPeer(peerId)) return false
+        // Sticker wire-encodings ride NIP-17 as content, exactly like the live
+        // sendDirectNip17 path: the receiver decodes them via meshParseStickerContent
+        // (see drainDirectDms) and privateDmMessage renders the local echo as a
+        // real sticker, so no raw control string leaks.
         val delivered = sendDirectNip17Now(peerId, npubRaw, queued.messageId, queued.content)
         if (!delivered) return false
         val msg = privateDmMessage(
