@@ -978,8 +978,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
         for (peerId in rawMeshPeerIds) {
-            if (peerId !in previousPeerIds && outbox.contains(peerId)) {
-                flushOutbox(peerId)
+            if (peerId !in previousPeerIds) {
+                if (outbox.contains(peerId)) flushOutbox(peerId)
+                flushPendingFavoriteControl(peerId)
             }
         }
         // Mesh peer set / first-seen / names feed the [visibleChats] hold filter.
@@ -1229,6 +1230,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         recomputeSociallyFilteredRows()
     }
 
+    /** Favorite/unfavorite controls that could not be written to a live BLE link
+     *  yet (mesh-only peer out of range with no npub route). The transport-level
+     *  hidden queue that used to carry these was removed for lying about
+     *  delivery, so the app owns the retry now: only the LATEST control per peer
+     *  matters, flushed whenever the peer's link (re)appears. iOS parity:
+     *  MessageRouter queues the same control in its outbox. */
+    private val pendingFavoriteControls = mutableMapOf<String, String>()
+
     private fun sendFavoriteStatusNotification(peerId: String, favorite: Boolean) {
         val payload = buildString {
             append(if (favorite) FAVORITED_CONTROL else UNFAVORITED_CONTROL)
@@ -1237,7 +1246,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 append(it)
             }
         }
-        MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)
+        if (MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)) {
+            pendingFavoriteControls.remove(peerId)
+        } else {
+            // No live Noise link — hold the control (it carries our npub, the
+            // seed of the mutual-favorite/NIP-17 continuation) for the next link.
+            pendingFavoriteControls[peerId] = payload
+        }
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
             runCatching {
@@ -4006,7 +4021,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val peerId = meshPeerId(chatId)
                             val mesh = meshChats[peerId].orEmpty()
                             val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
+                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, dedupePayLines(mesh + wn)))
                             setCurrentVisibleMessages(chatId, merged)
                         } else {
                             val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
@@ -4198,7 +4213,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val peerId = meshPeerId(chatId)
                             val mesh = meshChats[peerId].orEmpty()
                             val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
+                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, dedupePayLines(mesh + wn)))
                             setCurrentVisibleMessages(chatId, merged)
                         } else {
                             val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
@@ -4705,7 +4720,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val npubHex = npubRaw.toHexLower()
         pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(text)
-        toast = "Out of range — continuing over White Noise…"
+        toast = whiteNoiseFallbackToast(peerId)
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
@@ -4715,6 +4730,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             finally { startingMarmotChats.remove(npubHex) }
         }
     }
+
+    /** Fallback toast for a send that is continuing over White Noise. A mesh
+     *  write can fail while the peer is still technically linked (the
+     *  check-then-write race), so only claim "out of range" when the link is
+     *  actually gone. */
+    private fun whiteNoiseFallbackToast(peerId: String): String =
+        if (MeshRadio.hasMeshLink(peerId)) "Continuing over White Noise…"
+        else "Out of range — continuing over White Noise…"
 
     /** Flush texts queued for Sonar peers whose White Noise group now exists. */
     private fun sendStickerOverMarmot(
@@ -4732,7 +4755,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = npubRaw.toHexLower()
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
         pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(encoded)
-        toast = "Out of range — continuing over White Noise…"
+        toast = whiteNoiseFallbackToast(peerId)
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
@@ -4899,9 +4922,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Flush outbox for ALL peers that now have a reachable transport. Called
      *  periodically and on transport-change events. */
     private fun flushAllOutbox() {
+        for (peerId in pendingFavoriteControls.keys.toList()) {
+            flushPendingFavoriteControl(peerId)
+        }
         if (outbox.isEmpty()) return
         for (peerId in outbox.peerIds()) {
             flushOutbox(peerId)
+        }
+    }
+
+    /** Deliver the held favorite/unfavorite control once [peerId] has a live
+     *  Noise link again (see [pendingFavoriteControls]). */
+    private fun flushPendingFavoriteControl(peerId: String) {
+        val payload = pendingFavoriteControls[peerId] ?: return
+        if (MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)) {
+            pendingFavoriteControls.remove(peerId)
         }
     }
 
@@ -5215,7 +5250,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val chatId = meshChatId(peerId)
         val mesh = meshChats[peerId].orEmpty()
         val wn = marmotMessagesForPeer(peerId)
-        val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
+        val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, dedupePayLines(mesh + wn)))
         val visible = visibleMessagesForChat(chatId, merged)
         messages = visible
         processPayLines(chatId, visible)
@@ -6046,6 +6081,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     meshLinkVersion++
                     if (linkUp) {
                         flushOutbox(openPeerId)
+                        flushPendingFavoriteControl(openPeerId)
                         lastActivityMs = nowMs
                     }
                 }
