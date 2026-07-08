@@ -4250,7 +4250,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 return
             }
-            toast = "Not connected — stay close and try again"
+            // No npub yet: queue the sticker wire-encoding like text so it isn't
+            // dropped — the outbox re-sends it over mesh on re-link, or as a real
+            // sticker over White Noise if this peer's npub is learned first.
+            enqueueOutbox(peerId, content)
+            toast = "Out of range — message queued and will send automatically."
             return
         }
         scope.launch {
@@ -4829,9 +4833,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
                 continue
             }
-            // Try to send via the best available transport.
-            val delivered = if (MeshRadio.hasMeshLink(peerId)) {
-                sendMesh(peerId, msg.content)
+            // Try mesh first, then fall through to White Noise / NIP-17 exactly
+            // like the live sendDmAuto path. A mesh write can fail while the peer
+            // is still linked (the link dies between the hasMeshLink check and the
+            // GATT write) — treating that as terminal used to strand the whole
+            // queue on a "linked but unwritable" peer until the link dropped.
+            val meshOk = MeshRadio.hasMeshLink(peerId) && sendMesh(peerId, msg.content)
+            val delivered = if (meshOk) {
+                true
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
@@ -4888,7 +4897,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean {
         if (socialState.isBlockedPeer(peerId)) return false
         return try {
-            SonarCore.send(groupId, text)
+            // A queued item may be a mesh sticker wire-encoding (stickers can be
+            // enqueued when mesh is down); send it as a real sticker over Marmot
+            // rather than leaking the raw control string (mirrors flushPendingMarmot).
+            val ref = meshParseStickerContent(text)
+            if (ref != null) {
+                SonarCore.sendSticker(groupId, ref.packCoordinate, ref.shortcode, ref.plaintextSha256)
+            } else {
+                SonarCore.send(groupId, text)
+            }
             refreshOpenDm(peerId)
             true
         } catch (e: Throwable) {
@@ -6067,6 +6084,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             while (true) {
                 val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
+                // A Noise link (re)establishing flushes that peer's queued work
+                // regardless of whether its chat is open — the transport-level
+                // flush-on-establish this replaced was removed with the hidden
+                // queue, and the open-chat watch + announce-set re-entry below
+                // miss background chats whose peer stayed in the announce set.
+                val linkedUp = MeshRadio.drainMeshLinkUps()
+                if (linkedUp.isNotEmpty()) {
+                    lastActivityMs = nowMs
+                    for (fp in linkedUp) {
+                        flushOutbox(fp)
+                        flushPendingFavoriteControl(fp)
+                    }
+                    if (linkedUp.any { it == watchedPeerId }) meshLinkVersion++
+                }
                 // hasActivePeer() is a cheap link/announce probe — unlike
                 // peers() it doesn't build+sort the whole list every tick.
                 if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs

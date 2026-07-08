@@ -20,7 +20,9 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *
  * Replies (m2, encrypted DMs) go back out through the bridge's notify path. The
  * phone, not the desktop, initiates the handshake, so the desktop only ever plays
- * the responder; outbound DMs queue until that link forms.
+ * the responder. Outbound DMs are fail-fast: [sendDm] writes only over a fresh
+ * established session and returns false otherwise, so the app-level outbox (not
+ * this transport) owns retry and White Noise fallback.
  *
  * Scope: a single connected phone (bluster doesn't attribute writes to a specific
  * central, and notify reaches all subscribers) — enough for desktop↔phone DMs.
@@ -44,6 +46,7 @@ object MeshLink {
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
+    private val linkUps = ConcurrentLinkedQueue<String>()              // fps whose link just established
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -103,13 +106,18 @@ object MeshLink {
         }
         val now = System.currentTimeMillis()
         seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
-        // Desktop gets NO BLE disconnect callback (bluster stubs CoreBluetooth's,
-        // see handleHandshake), so an established Noise session never learns the
-        // phone left range. Drop sessions whose peer aged out of seenByFp — else
-        // hasLink() reports a zombie link forever, dmInRange keeps the chat on
-        // "Bluetooth", and sendDm notifies into the void (returns true) instead of
-        // falling back to White Noise.
-        sessions.keys.retainAll(seenByFp.keys)
+        // NOTE: we deliberately do NOT drop `sessions` here. Desktop gets no BLE
+        // disconnect callback (bluster stubs CoreBluetooth's), so a quiet-but-
+        // still-connected phone ages out of seenByFp even though its Noise
+        // session is live — and Android does not re-announce on a steady cadence
+        // over an open link. Destroying the session on that timeout silently
+        // dropped inbound phone→desktop DMs (handleEncrypted bails when
+        // sessions[fp] is gone) while the phone still believed the link was up.
+        // Freshness now gates only REACHABILITY (hasLink / sendDm / sendDmNow via
+        // [isFresh]), so a stale peer stops being reported in-range and outbound
+        // sends fall back to White Noise — but the crypto session survives so an
+        // inbound DM still decrypts (and its touch() revives freshness). The
+        // session is torn down only by re-handshake, decrypt failure, or wipe.
         // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
         // range stops being reported as a live Sonar user by [sonarPeers].
         sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
@@ -161,6 +169,7 @@ object MeshLink {
             s.noise.readMessage(m) // m1, then m3
             if (s.noise.isFinished()) {
                 s.noise.intoSession(); s.established = true
+                linkUps.add(fp) // surface the re-link so the app flushes queued work
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
             } else {
                 val m2 = s.noise.writeMessage()
@@ -184,31 +193,33 @@ object MeshLink {
         touch(fp)
     }
 
-    /** True only for an established session whose peer is still fresh. The
-     *  freshness gate is what makes desktop reachability honest: there is no BLE
-     *  disconnect callback (bluster stubs it), so without the [seenByFp] TTL an
-     *  established session would report "in range" forever after the phone left,
-     *  and [dmInRange] would keep echoing DMs as mesh-sent instead of falling
-     *  back to White Noise. `seenByFp` is touched by EVERY well-formed packet
-     *  from a mapped sender (see [pump]) — announce, handshake, DM, 0x53, and
-     *  gossip frames alike — so a connected phone stays fresh inside
-     *  [PEER_TTL_MS]. */
-    fun hasLink(fp: String): Boolean {
-        val s = sessions[fp] ?: return false
-        if (!s.established) return false
-        val seen = seenByFp[fp] ?: return false
-        return System.currentTimeMillis() - seen < PEER_TTL_MS
+    /** An established session whose peer is still fresh. This is the single
+     *  reachability predicate shared by [hasLink], [sendDm] and [sendDmNow], so
+     *  they can never disagree: a stale desktop session (see [pump] — the crypto
+     *  survives the [seenByFp] TTL so inbound DMs still decrypt) must NOT be
+     *  reported in-range NOR accept an outbound write that `BleBridge.notify`
+     *  would sink into the void. `seenByFp` is touched by EVERY well-formed
+     *  packet from a mapped sender (announce, handshake, DM, 0x53, gossip), so a
+     *  connected phone stays fresh inside [PEER_TTL_MS]. */
+    private fun freshSession(fp: String): Session? {
+        val s = sessions[fp]?.takeIf { it.established } ?: return null
+        val seen = seenByFp[fp] ?: return null
+        return if (System.currentTimeMillis() - seen < PEER_TTL_MS) s else null
     }
 
+    fun hasLink(fp: String): Boolean = freshSession(fp) != null
+
     fun sendDm(fp: String, messageId: String, text: String): Boolean {
-        // No hidden queue: report failure honestly so the app-level outbox can
-        // retry or continue the conversation over White Noise (mirrors Android).
-        val s = sessions[fp]?.takeIf { it.established } ?: return false
+        // No hidden queue and no stale-session write: report failure honestly so
+        // the app-level outbox can retry or continue over White Noise (mirrors
+        // Android, and matches hasLink so callers that skip the reachability gate
+        // — e.g. flushPendingFavoriteControl — can't "succeed" into the void).
+        val s = freshSession(fp) ?: return false
         return encryptAndSend(fp, s, messageId, text)
     }
 
     fun sendDmNow(fp: String, messageId: String, text: String): Boolean {
-        val s = sessions[fp]?.takeIf { it.established } ?: return false
+        val s = freshSession(fp) ?: return false
         return encryptAndSend(fp, s, messageId, text)
     }
 
@@ -231,6 +242,13 @@ object MeshLink {
         return out
     }
 
+    /** Fingerprints whose Noise link established since the last call. */
+    fun drainLinkUps(): List<String> {
+        val out = ArrayList<String>()
+        while (true) out.add(linkUps.poll() ?: break)
+        return out
+    }
+
     /** Named, deduped mesh peers (from the announce), fresh within the TTL. */
     fun namedPeers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
@@ -248,6 +266,6 @@ object MeshLink {
 
     fun wipe() {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
-        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear()
+        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); linkUps.clear()
     }
 }
