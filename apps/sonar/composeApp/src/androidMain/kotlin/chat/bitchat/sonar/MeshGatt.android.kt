@@ -123,12 +123,25 @@ object MeshGatt {
      *  sent but m2/m3 lost to an intermittent BLE link) can be retried instead of
      *  blocking forever. */
     private class Link(val noise: SonarNoise, var established: Boolean = false, var startedMs: Long = 0L)
-    private data class OutboundDelivery(
-        val peerId: String,
-        val messageId: String,
+    private sealed interface OutboundDelivery {
+        val peerId: String
+        val messageId: String
+        val tsSecs: Long
+    }
+    private data class TextDelivery(
+        override val peerId: String,
+        override val messageId: String,
         val text: String,
-        val tsSecs: Long,
-    )
+        override val tsSecs: Long,
+    ) : OutboundDelivery
+    private data class MediaDelivery(
+        override val peerId: String,
+        override val messageId: String,
+        val bytes: ByteArray,
+        val filename: String,
+        val mimeType: String,
+        override val tsSecs: Long,
+    ) : OutboundDelivery
     private data class OutboundPacket(
         val bytes: ByteArray,
         val delivery: OutboundDelivery? = null,
@@ -160,6 +173,7 @@ object MeshGatt {
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
     private val onSendFailure = java.util.concurrent.CopyOnWriteArrayList<(MeshSendFailure) -> Unit>()
+    private val onMediaSendFailure = java.util.concurrent.CopyOnWriteArrayList<(MeshMediaSendFailure) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** Dedup file transfers by packet sender + packet timestamp. */
@@ -172,6 +186,7 @@ object MeshGatt {
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
     fun addSendFailureListener(cb: (MeshSendFailure) -> Unit) { onSendFailure.add(cb) }
+    fun addMediaSendFailureListener(cb: (MeshMediaSendFailure) -> Unit) { onMediaSendFailure.add(cb) }
 
     /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
     private fun fingerprintOf(noisePublicKeyHex: String): String =
@@ -884,24 +899,11 @@ object MeshGatt {
         }
     }
 
-    private fun writePacketMaybeFragmented(
-        peerAddress: String,
-        packet: ByteArray,
-        originalType: UByte = TYPE_NOISE_ENCRYPTED,
-        write: (ByteArray) -> Unit,
-    ): Boolean = runCatching {
-        packetFrames(peerAddress, packet, originalType).forEach(write)
-        true
-    }.getOrElse {
-        android.util.Log.w(TAG, "fragment/write failed for $peerAddress: ${it.message}")
-        false
-    }
-
     /** Send an encrypted DM to an established, writable peer route. */
     @Synchronized
     fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
         val fingerprint = fingerprintByAddr[peerAddress] ?: return@runCatching false
-        val delivery = OutboundDelivery(fingerprint, messageId, text, System.currentTimeMillis() / 1000)
+        val delivery = TextDelivery(fingerprint, messageId, text, System.currentTimeMillis() / 1000)
         val client = clientLinks[peerAddress]?.takeIf { it.established }
         val gatt = clientGatt[peerAddress]
         val ch = clientChar[peerAddress]
@@ -961,33 +963,72 @@ object MeshGatt {
     /** Immediate send for real-time controls. Never queues. */
     fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
         val addr = sendableAddrFor(fingerprint) ?: return false
-        sendDiscoveryToAddr(addr, "pre-control")
-        return sendText(addr, messageId, text)
+        val sent = sendText(addr, messageId, text)
+        if (sent) sendDiscoveryToAddr(addr, "post-control")
+        return sent
     }
 
-    /** Send a private file transfer to a live peer route. Binary media is not
-     * queued: large stale transfers after a BLE reconnect are worse than an
-     * immediate route failure, and Marmot remains the out-of-range fallback. */
+    /** Send a private file transfer to a live peer route. Fragments use only the
+     * current GATT lifetime: they are never retained across a reconnect, and any
+     * later write failure returns the original bytes to the app's fallback path. */
     fun sendFileToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean {
         val addr = sendableAddrFor(fingerprint) ?: return false
-        sendDiscoveryToAddr(addr, "pre-file")
-        return sendFile(addr, bytes, filename, mimeType)
+        val sent = sendFile(addr, messageId, bytes, filename, mimeType)
+        if (sent) sendDiscoveryToAddr(addr, "post-file")
+        return sent
     }
 
-    private fun sendFile(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = runCatching {
-        val packet = fileTransferPacket(peerAddress, bytes, filename, mimeType) ?: return@runCatching false
+    @Synchronized
+    private fun sendFile(
+        peerAddress: String,
+        messageId: String,
+        bytes: ByteArray,
+        filename: String,
+        mimeType: String,
+    ): Boolean = runCatching {
+        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return@runCatching false
+        val fingerprint = fingerprintByAddr[peerAddress] ?: return@runCatching false
+        val delivery = MediaDelivery(
+            fingerprint,
+            messageId,
+            bytes.copyOf(),
+            filename,
+            mimeType,
+            System.currentTimeMillis() / 1000,
+        )
+        val client = clientLinks[peerAddress]?.takeIf { it.established }
         val gatt = clientGatt[peerAddress]
         val ch = clientChar[peerAddress]
-        if (gatt != null && ch != null) {
-            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { writePacket(gatt, ch, it) }
+        if (client != null && gatt != null && ch != null) {
+            if (clientWriting.contains(peerAddress) || clientWriteQueue[peerAddress]?.isNotEmpty() == true) {
+                return@runCatching false
+            }
+            val packet = fileTransferPacket(peerAddress, bytes, filename, mimeType) ?: return@runCatching false
+            return@runCatching issueTrackedClientWrite(
+                gatt,
+                ch,
+                packetFrames(peerAddress, packet, TYPE_FILE_TRANSFER),
+                delivery,
+            )
         }
+        val link = serverLinks[peerAddress]?.takeIf { it.established }
         val device = serverDevices[peerAddress]
-        if (device != null) {
-            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { notify(device, it) }
+        if (link != null && device != null) {
+            if (serverNotifying.contains(peerAddress) || serverNotifyQueue[peerAddress]?.isNotEmpty() == true) {
+                return@runCatching false
+            }
+            val packet = fileTransferPacket(peerAddress, bytes, filename, mimeType) ?: return@runCatching false
+            return@runCatching issueTrackedServerNotify(
+                device,
+                packetFrames(peerAddress, packet, TYPE_FILE_TRANSFER),
+                delivery,
+            )
         }
         false
     }.getOrElse {
         android.util.Log.w(TAG, "sendFile failed for $peerAddress: ${it.message}")
+        if (clientLinks.containsKey(peerAddress)) cleanupClient(peerAddress, reportPendingFailures = false)
+        if (serverLinks.containsKey(peerAddress)) cleanupServer(peerAddress, reportPendingFailures = false)
         false
     }
 
@@ -1103,7 +1144,7 @@ object MeshGatt {
         clientInFlight[addr] = next
         if (!issueWrite(gatt, ch, next.bytes)) {
             // The write wasn't accepted ⇒ onCharacteristicWrite won't fire; don't
-            // report a tracked DM as sent. Untracked discovery traffic can move on.
+            // report a tracked delivery as sent. Untracked discovery traffic can move on.
             android.util.Log.w(TAG, "write not accepted for $addr")
             clientInFlight.remove(addr)
             clientWriting.remove(addr)
@@ -1225,13 +1266,28 @@ object MeshGatt {
 
     private fun reportSendFailures(deliveries: List<OutboundDelivery>) {
         deliveries.distinctBy { it.messageId }.forEach { delivery ->
-            val failure = MeshSendFailure(
-                delivery.peerId,
-                delivery.messageId,
-                delivery.text,
-                delivery.tsSecs,
-            )
-            onSendFailure.forEach { listener -> runCatching { listener(failure) } }
+            when (delivery) {
+                is TextDelivery -> {
+                    val failure = MeshSendFailure(
+                        delivery.peerId,
+                        delivery.messageId,
+                        delivery.text,
+                        delivery.tsSecs,
+                    )
+                    onSendFailure.forEach { listener -> runCatching { listener(failure) } }
+                }
+                is MediaDelivery -> {
+                    val failure = MeshMediaSendFailure(
+                        delivery.peerId,
+                        delivery.messageId,
+                        delivery.bytes,
+                        delivery.filename,
+                        delivery.mimeType,
+                        delivery.tsSecs,
+                    )
+                    onMediaSendFailure.forEach { listener -> runCatching { listener(failure) } }
+                }
+            }
         }
     }
 

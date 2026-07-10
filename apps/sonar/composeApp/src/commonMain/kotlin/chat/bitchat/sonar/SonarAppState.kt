@@ -3988,9 +3988,27 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return
             }
         }
+        sendMediaOverMarmot(
+            chatId,
+            data,
+            filename,
+            mime,
+            missingRouteMessage = "Start the secure chat first, then send a photo.",
+            failureLabel = "photo",
+        )
+    }
+
+    private fun sendMediaOverMarmot(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        missingRouteMessage: String,
+        failureLabel: String,
+    ) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            if (groupId == null) { toast = missingRouteMessage; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
@@ -4024,7 +4042,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 SonarCore.sendMedia(groupId, data, filename, mime, "")
                 markPendingMediaCompleted(chatId, pendingId)
-                // Refresh the open conversation so the sent image shows.
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
@@ -4044,7 +4061,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
-                toast = "couldn't send photo: ${e.message}"
+                toast = "couldn't send $failureLabel: ${e.message}"
             }
         }
     }
@@ -4205,64 +4222,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return
             }
         }
-        scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
-            val pendingId = "pending-media-${randomMeshId()}"
-            val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
-            val startedAtSecs = SonarClock.nowSecs()
-            val existingMediaUrls = existingPublishedMediaUrls(groupId)
-            val pending = SonarMsg(
-                id = pendingId,
-                senderNpub = npub,
-                content = "",
-                mine = true,
-                tsSecs = startedAtSecs,
-                viaInternet = true,
-                media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
-                state = "Uploading",
-            )
-            rememberPendingMediaUpload(
-                chatId,
-                PendingMediaUpload(
-                    message = pending,
-                    data = bytes,
-                    filename = filename,
-                    mime = mime,
-                    startedAtSecs = startedAtSecs,
-                    pendingUrl = pendingUrl,
-                    existingMediaUrls = existingMediaUrls,
-                )
-            )
-            mediaCache[pendingUrl] = bytes
-            if ((screen as? Screen.Chat)?.id == chatId) {
-                messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
-            }
-            try {
-                SonarCore.sendMedia(groupId, bytes, filename, mime, "")
-                markPendingMediaCompleted(chatId, pendingId)
-                (screen as? Screen.Chat)?.let { sc ->
-                    if (sc.id == chatId) {
-                        if (isMeshChat(chatId)) {
-                            val peerId = meshPeerId(chatId)
-                            val mesh = meshChats[peerId].orEmpty()
-                            val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, dedupePayLines(mesh + wn)))
-                            setCurrentVisibleMessages(chatId, merged)
-                        } else {
-                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
-                            setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
-                        }
-                    }
-                }
-            } catch (e: Throwable) {
-                markPendingMediaFailed(chatId, pendingId)
-                if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
-                }
-                toast = "couldn't send voice note: ${e.message}"
-            }
-        }
+        sendMediaOverMarmot(
+            chatId,
+            bytes,
+            filename,
+            mime,
+            missingRouteMessage = "Start the secure chat first to send a voice note.",
+            failureLabel = "voice note",
+        )
     }
 
     fun sendGifItem(chatId: String, item: SonarGifItem) {
@@ -5517,6 +5484,48 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
+    /** Remove an optimistic BLE media echo after a later fragment/callback
+     *  failure, then retry the original bytes over the existing Marmot route. */
+    private fun drainMeshMediaSendFailures(): Boolean {
+        val failures = MeshRadio.drainMeshMediaSendFailures()
+        if (failures.isEmpty()) return false
+        val touched = mutableSetOf<String>()
+        for (failure in failures) {
+            val peerId = normalizeSocialPeerId(failure.peerId)
+            val mediaUrl = meshMediaUrl(peerId, failure.messageId, failure.filename)
+            mediaCache.remove(mediaUrl)
+            val before = meshChats[peerId].orEmpty()
+            val after = before.filterNot { it.id == failure.messageId }
+            if (after.size != before.size) {
+                meshChats[peerId] = after
+                touched += peerId
+            }
+            if (socialState.isBlockedPeer(peerId)) continue
+            val failureLabel = when {
+                failure.mimeType.startsWith("audio/") -> "voice note"
+                failure.mimeType.startsWith("image/") -> "photo"
+                else -> "file"
+            }
+            sendMediaOverMarmot(
+                meshChatId(peerId),
+                failure.bytes,
+                failure.filename,
+                failure.mimeType,
+                missingRouteMessage = "Media wasn't sent — stay close and try again",
+                failureLabel = failureLabel,
+            )
+        }
+        touched.forEach { persistMesh(it) }
+        if (touched.isNotEmpty()) {
+            refreshMeshDmRows()
+            (screen as? Screen.Chat)?.let { open ->
+                val peerId = open.id.takeIf { isMeshChat(it) }?.let { meshPeerId(it) }
+                if (peerId != null && peerId in touched) scope.launch { refreshOpenDm(peerId) }
+            }
+        }
+        return true
+    }
+
     private suspend fun drainDirectDms() {
         val incoming = runCatching { SonarCore.drainDirectDms() }.getOrDefault(emptyList())
         if (incoming.isEmpty()) return
@@ -6169,7 +6178,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             var watchedPeerId: String? = null
             var watchedLinkUp = false
             while (true) {
-                val drained = drainMeshDms() or drainMeshSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
+                val drained = drainMeshDms() or drainMeshSendFailures() or
+                    drainMeshMediaSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // A Noise link (re)establishing flushes that peer's queued work
                 // regardless of whether its chat is open — the transport-level
