@@ -4827,8 +4827,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Queue a message for [peerId] when no transport is available. Enforces
      *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
-    private fun enqueueOutbox(peerId: String, text: String) {
-        val result = outbox.enqueue(peerId, text, randomMeshId(), SonarClock.nowSecs())
+    private fun enqueueOutbox(
+        peerId: String,
+        text: String,
+        messageId: String = randomMeshId(),
+        timestampSecs: Long = SonarClock.nowSecs(),
+    ) {
+        val result = outbox.enqueue(peerId, text, messageId, timestampSecs)
         result.evicted?.let { evicted ->
             sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
         }
@@ -5466,6 +5471,47 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
                 if (incoming.any { it.peerId == pid }) scope.launch { refreshOpenDm(pid) }
+            }
+        }
+        return true
+    }
+
+    /** Re-enter router-owned fallback after a platform accepted a mesh send but
+     *  later reported that its write/notify failed. Remove the optimistic BLE
+     *  echo first so a successful White Noise retry cannot render a duplicate. */
+    private fun drainMeshSendFailures(): Boolean {
+        val failures = MeshRadio.drainMeshSendFailures()
+        if (failures.isEmpty()) return false
+        val touched = mutableSetOf<String>()
+        for (failure in failures) {
+            val peerId = normalizeSocialPeerId(failure.peerId)
+            val before = meshChats[peerId].orEmpty()
+            val after = before.filterNot { it.id == failure.messageId }
+            if (after.size != before.size) {
+                meshChats[peerId] = after
+                touched += peerId
+            }
+            if (socialState.isBlockedPeer(peerId)) continue
+            when {
+                failure.text.startsWith(FAVORITED_CONTROL) || failure.text.startsWith(UNFAVORITED_CONTROL) -> {
+                    pendingFavoriteControls.hold(peerId, failure.text)
+                }
+                SonarCore.callParseControl(failure.text) != null -> {
+                    toast = "Call route dropped — try again in a moment."
+                    sonarLog("SonarCall", "async mesh control failure peer=${peerId.take(10)} id=${failure.messageId.take(8)}")
+                }
+                else -> {
+                    enqueueOutbox(peerId, failure.text, failure.messageId, failure.tsSecs)
+                    flushOutbox(peerId)
+                }
+            }
+        }
+        touched.forEach { persistMesh(it) }
+        if (touched.isNotEmpty()) {
+            refreshMeshDmRows()
+            (screen as? Screen.Chat)?.let { open ->
+                val peerId = open.id.takeIf { isMeshChat(it) }?.let { meshPeerId(it) }
+                if (peerId != null && peerId in touched) scope.launch { refreshOpenDm(peerId) }
             }
         }
         return true
@@ -6123,7 +6169,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             var watchedPeerId: String? = null
             var watchedLinkUp = false
             while (true) {
-                val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
+                val drained = drainMeshDms() or drainMeshSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // A Noise link (re)establishing flushes that peer's queued work
                 // regardless of whether its chat is open — the transport-level

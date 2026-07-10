@@ -123,6 +123,16 @@ object MeshGatt {
      *  sent but m2/m3 lost to an intermittent BLE link) can be retried instead of
      *  blocking forever. */
     private class Link(val noise: SonarNoise, var established: Boolean = false, var startedMs: Long = 0L)
+    private data class OutboundDelivery(
+        val peerId: String,
+        val messageId: String,
+        val text: String,
+        val tsSecs: Long,
+    )
+    private data class OutboundPacket(
+        val bytes: ByteArray,
+        val delivery: OutboundDelivery? = null,
+    )
     private val serverLinks = ConcurrentHashMap<String, Link>()
     private val serverDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
@@ -149,6 +159,7 @@ object MeshGatt {
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
+    private val onSendFailure = java.util.concurrent.CopyOnWriteArrayList<(MeshSendFailure) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** Dedup file transfers by packet sender + packet timestamp. */
@@ -160,6 +171,7 @@ object MeshGatt {
      *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
+    fun addSendFailureListener(cb: (MeshSendFailure) -> Unit) { onSendFailure.add(cb) }
 
     /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
     private fun fingerprintOf(noisePublicKeyHex: String): String =
@@ -309,9 +321,14 @@ object MeshGatt {
     }
 
     fun stop() {
+        (serverDevices.keys + serverLinks.keys + serverNotifyQueue.keys + serverInFlight.keys)
+            .toSet()
+            .forEach { cleanupServer(it) }
+        (clientGatt.keys + clientLinks.keys + clientWriteQueue.keys + clientInFlight.keys)
+            .toSet()
+            .forEach { cleanupClient(it) }
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
-        clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
         fingerprintByPeerId.clear(); recentDials.clear()
@@ -352,15 +369,24 @@ object MeshGatt {
         cleanupClient(addr)
     }
 
-    private fun cleanupServer(addr: String) {
+    @Synchronized
+    private fun cleanupServer(
+        addr: String,
+        reportPendingFailures: Boolean = true,
+        extraDelivery: OutboundDelivery? = null,
+    ) {
+        val failed = ArrayList<OutboundDelivery>()
+        extraDelivery?.let(failed::add)
+        serverInFlight.remove(addr)?.delivery?.let(failed::add)
+        serverNotifyQueue.remove(addr)?.mapNotNullTo(failed) { it.delivery }
+        serverNotifying.remove(addr)
         val device = serverDevices.remove(addr)
         if (device != null) runCatching { server?.cancelConnection(device) }
         serverLinks.remove(addr)
         peerIdByAddr.remove(addr)
         fingerprintByAddr.remove(addr)
         pendingSonarByAddr.remove(addr)
-        serverNotifyQueue.remove(addr)
-        serverNotifying.remove(addr)
+        if (reportPendingFailures) reportSendFailures(failed)
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -373,9 +399,7 @@ object MeshGatt {
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            // Slot free → drain the next queued notify (one outstanding at a time).
-            serverNotifying.remove(device.address)
-            pumpServerNotify(device.address)
+            completeServerNotify(device.address, status)
         }
 
         override fun onDescriptorWriteRequest(
@@ -537,9 +561,7 @@ object MeshGatt {
             // status 0 = GATT_SUCCESS. Either way the slot is now free → drain the
             // next queued write (one outstanding write at a time is the hard limit
             // that was dropping our handshake m1).
-            val addr = gatt.device.address
-            clientWriting.remove(addr)
-            pumpClientWrites(addr)
+            completeClientWrite(gatt.device.address, status)
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
@@ -552,12 +574,22 @@ object MeshGatt {
         }
     }
 
-    private fun cleanupClient(addr: String) {
+    @Synchronized
+    private fun cleanupClient(
+        addr: String,
+        reportPendingFailures: Boolean = true,
+        extraDelivery: OutboundDelivery? = null,
+    ) {
+        val failed = ArrayList<OutboundDelivery>()
+        extraDelivery?.let(failed::add)
+        clientInFlight.remove(addr)?.delivery?.let(failed::add)
+        clientWriteQueue.remove(addr)?.mapNotNullTo(failed) { it.delivery }
+        clientWriting.remove(addr)
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
         pendingSonarByAddr.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
-        clientWriteQueue.remove(addr); clientWriting.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
+        if (reportPendingFailures) reportSendFailures(failed)
     }
 
     // ── Receive: route every characteristic value (one padded packet) by type ──
@@ -828,22 +860,20 @@ object MeshGatt {
     private fun randomFragmentIdHex(): String =
         ByteArray(8).also { SecureRandom().nextBytes(it) }.toHex()
 
-    private fun writePacketMaybeFragmented(
+    private fun packetFrames(
         peerAddress: String,
         packet: ByteArray,
         originalType: UByte = TYPE_NOISE_ENCRYPTED,
-        write: (ByteArray) -> Unit,
-    ): Boolean = runCatching {
+    ): List<ByteArray> {
         if (packet.size <= MAX_SINGLE_GATT_PACKET_BYTES) {
-            write(packet)
-            return@runCatching true
+            return listOf(packet)
         }
 
         val peerId = peerIdByAddr[peerAddress] ?: ""
         val fragments = meshFragment(packet, randomFragmentIdHex(), originalType, FRAGMENT_CHUNK_SIZE)
         android.util.Log.i(TAG, "fragmenting 0x${originalType.toString(16)} packet ${packet.size}B into ${fragments.size} chunk(s) → $peerAddress")
-        fragments.forEach { payload ->
-            val fragmentPacket = meshBuildPacket(
+        return fragments.map { payload ->
+            meshBuildPacket(
                 TYPE_FRAGMENT,
                 myPeerIdHex,
                 peerId,
@@ -851,8 +881,16 @@ object MeshGatt {
                 System.currentTimeMillis().toULong(),
                 payload,
             )
-            write(fragmentPacket)
         }
+    }
+
+    private fun writePacketMaybeFragmented(
+        peerAddress: String,
+        packet: ByteArray,
+        originalType: UByte = TYPE_NOISE_ENCRYPTED,
+        write: (ByteArray) -> Unit,
+    ): Boolean = runCatching {
+        packetFrames(peerAddress, packet, originalType).forEach(write)
         true
     }.getOrElse {
         android.util.Log.w(TAG, "fragment/write failed for $peerAddress: ${it.message}")
@@ -860,27 +898,36 @@ object MeshGatt {
     }
 
     /** Send an encrypted DM to an established, writable peer route. */
+    @Synchronized
     fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
+        val fingerprint = fingerprintByAddr[peerAddress] ?: return@runCatching false
+        val delivery = OutboundDelivery(fingerprint, messageId, text, System.currentTimeMillis() / 1000)
         val client = clientLinks[peerAddress]?.takeIf { it.established }
         val gatt = clientGatt[peerAddress]
         val ch = clientChar[peerAddress]
         if (client != null && gatt != null && ch != null) {
-            return@runCatching writePacketMaybeFragmented(
-                peerAddress,
-                encryptedPrivatePacket(peerAddress, client, messageId, text),
-            ) { writePacket(gatt, ch, it) }
+            if (clientWriting.contains(peerAddress) || clientWriteQueue[peerAddress]?.isNotEmpty() == true) {
+                return@runCatching false
+            }
+            val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, client, messageId, text))
+            return@runCatching issueTrackedClientWrite(gatt, ch, frames, delivery)
         }
         val server = serverLinks[peerAddress]?.takeIf { it.established }
         val device = serverDevices[peerAddress]
         if (server != null && device != null) {
-            return@runCatching writePacketMaybeFragmented(
-                peerAddress,
-                encryptedPrivatePacket(peerAddress, server, messageId, text),
-            ) { notify(device, it) }
+            if (serverNotifying.contains(peerAddress) || serverNotifyQueue[peerAddress]?.isNotEmpty() == true) {
+                return@runCatching false
+            }
+            val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, server, messageId, text))
+            return@runCatching issueTrackedServerNotify(device, frames, delivery)
         }
         false
     }.getOrElse {
         android.util.Log.w(TAG, "sendText failed for $peerAddress: ${it.message}")
+        // Encryption advances the Noise nonce. Any failure after that point must
+        // discard the route so a later send cannot diverge from the peer's nonce.
+        if (clientLinks.containsKey(peerAddress)) cleanupClient(peerAddress, reportPendingFailures = false)
+        if (serverLinks.containsKey(peerAddress)) cleanupServer(peerAddress, reportPendingFailures = false)
         false
     }
 
@@ -1013,12 +1060,35 @@ object MeshGatt {
     // onCharacteristicWrite — so issuing announce + Noise m1 + 0x53 back-to-back
     // silently DROPPED the middle write (the handshake m1), and the Noise DM never
     // established. Serialize: enqueue, issue one at a time, drain on completion.
-    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
+    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<OutboundPacket>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val clientInFlight = ConcurrentHashMap<String, OutboundPacket>()
 
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
-        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
+        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(OutboundPacket(packet))
         pumpClientWrites(gatt.device.address)
+    }
+
+    @Synchronized
+    private fun issueTrackedClientWrite(
+        gatt: BluetoothGatt,
+        ch: BluetoothGattCharacteristic,
+        frames: List<ByteArray>,
+        delivery: OutboundDelivery,
+    ): Boolean {
+        val addr = gatt.device.address
+        val first = frames.firstOrNull() ?: return false
+        val current = OutboundPacket(first, delivery)
+        val queue = clientWriteQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }
+        frames.drop(1).forEach { queue.add(OutboundPacket(it, delivery)) }
+        clientWriting.add(addr)
+        clientInFlight[addr] = current
+        if (issueWrite(gatt, ch, current.bytes)) return true
+        clientInFlight.remove(addr)
+        clientWriting.remove(addr)
+        queue.removeIf { it.delivery?.messageId == delivery.messageId }
+        cleanupClient(addr, reportPendingFailures = false)
+        return false
     }
 
     /** Issue the next queued write for [addr] iff none is in flight. */
@@ -1030,11 +1100,25 @@ object MeshGatt {
         val gatt = clientGatt[addr] ?: return
         val ch = clientChar[addr] ?: return
         clientWriting.add(addr)
-        if (!issueWrite(gatt, ch, next)) {
+        clientInFlight[addr] = next
+        if (!issueWrite(gatt, ch, next.bytes)) {
             // The write wasn't accepted ⇒ onCharacteristicWrite won't fire; don't
-            // stall the queue — drop it and move on.
-            android.util.Log.w(TAG, "write not accepted for $addr — skipping")
+            // report a tracked DM as sent. Untracked discovery traffic can move on.
+            android.util.Log.w(TAG, "write not accepted for $addr")
+            clientInFlight.remove(addr)
             clientWriting.remove(addr)
+            if (next.delivery != null) cleanupClient(addr, extraDelivery = next.delivery)
+            else pumpClientWrites(addr)
+        }
+    }
+
+    @Synchronized
+    private fun completeClientWrite(addr: String, status: Int) {
+        val completed = clientInFlight.remove(addr)
+        clientWriting.remove(addr)
+        if (status != BluetoothGatt.GATT_SUCCESS && completed?.delivery != null) {
+            cleanupClient(addr, extraDelivery = completed.delivery)
+        } else {
             pumpClientWrites(addr)
         }
     }
@@ -1054,12 +1138,45 @@ object MeshGatt {
     // Server notify queue — same one-outstanding-at-a-time rule as client writes
     // (the next notify must wait for onNotificationSent), so the announce + 0x53 +
     // handshake m2 a server emits back-to-back must be serialized or they drop.
-    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
+    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<OutboundPacket>>()
     private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val serverInFlight = ConcurrentHashMap<String, OutboundPacket>()
 
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
+        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(OutboundPacket(packet))
         pumpServerNotify(device.address)
+    }
+
+    @Synchronized
+    private fun issueTrackedServerNotify(
+        device: BluetoothDevice,
+        frames: List<ByteArray>,
+        delivery: OutboundDelivery,
+    ): Boolean {
+        val addr = device.address
+        val s = server ?: run {
+            cleanupServer(addr, reportPendingFailures = false)
+            return false
+        }
+        val ch = characteristic ?: run {
+            cleanupServer(addr, reportPendingFailures = false)
+            return false
+        }
+        val first = frames.firstOrNull() ?: run {
+            cleanupServer(addr, reportPendingFailures = false)
+            return false
+        }
+        val current = OutboundPacket(first, delivery)
+        val queue = serverNotifyQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }
+        frames.drop(1).forEach { queue.add(OutboundPacket(it, delivery)) }
+        serverNotifying.add(addr)
+        serverInFlight[addr] = current
+        if (issueNotify(s, device, ch, current.bytes)) return true
+        serverInFlight.remove(addr)
+        serverNotifying.remove(addr)
+        queue.removeIf { it.delivery?.messageId == delivery.messageId }
+        cleanupServer(addr, reportPendingFailures = false)
+        return false
     }
 
     private fun notifyDiscoveryBurst(device: BluetoothDevice) {
@@ -1086,9 +1203,35 @@ object MeshGatt {
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return
         serverNotifying.add(addr)
-        if (!issueNotify(s, device, ch, next)) {
+        serverInFlight[addr] = next
+        if (!issueNotify(s, device, ch, next.bytes)) {
+            serverInFlight.remove(addr)
             serverNotifying.remove(addr)
+            if (next.delivery != null) cleanupServer(addr, extraDelivery = next.delivery)
+            else pumpServerNotify(addr)
+        }
+    }
+
+    @Synchronized
+    private fun completeServerNotify(addr: String, status: Int) {
+        val completed = serverInFlight.remove(addr)
+        serverNotifying.remove(addr)
+        if (status != BluetoothGatt.GATT_SUCCESS && completed?.delivery != null) {
+            cleanupServer(addr, extraDelivery = completed.delivery)
+        } else {
             pumpServerNotify(addr)
+        }
+    }
+
+    private fun reportSendFailures(deliveries: List<OutboundDelivery>) {
+        deliveries.distinctBy { it.messageId }.forEach { delivery ->
+            val failure = MeshSendFailure(
+                delivery.peerId,
+                delivery.messageId,
+                delivery.text,
+                delivery.tsSecs,
+            )
+            onSendFailure.forEach { listener -> runCatching { listener(failure) } }
         }
     }
 
