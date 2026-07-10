@@ -448,6 +448,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingDirectMarmotSends.clear()
             pendingMarmotGroupSends.clear()
             outbox.clear()
+            pendingFavoriteControls.clear()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
@@ -487,7 +488,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear(); pendingFavoriteControls.clear()
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
@@ -1236,7 +1237,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  delivery, so the app owns the retry now: only the LATEST control per peer
      *  matters, flushed whenever the peer's link (re)appears. iOS parity:
      *  MessageRouter queues the same control in its outbox. */
-    private val pendingFavoriteControls = mutableMapOf<String, String>()
+    private val pendingFavoriteControls = PendingFavoriteControls()
 
     private fun sendFavoriteStatusNotification(peerId: String, favorite: Boolean) {
         val payload = buildString {
@@ -1247,11 +1248,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         if (MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)) {
-            pendingFavoriteControls.remove(peerId)
+            pendingFavoriteControls.delivered(peerId)
         } else {
             // No live Noise link — hold the control (it carries our npub, the
             // seed of the mutual-favorite/NIP-17 continuation) for the next link.
-            pendingFavoriteControls[peerId] = payload
+            pendingFavoriteControls.hold(peerId, payload)
         }
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
@@ -1287,7 +1288,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (peerId != null) socialState = socialState.withBlockedPeer(peerId, blocked)
         if (npubHex != null) socialState = socialState.withBlockedNostr(npubHex, blocked)
-        if (blocked && peerId != null) socialState = socialState.withFavoritePeer(peerId, false)
+        if (blocked && peerId != null) {
+            socialState = socialState.withFavoritePeer(peerId, false)
+            pendingFavoriteControls.discard(peerId)
+        }
         persistSocialState()
         toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
         recomputeSociallyFilteredRows()
@@ -1314,7 +1318,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         npubRawFor(key)?.toHexLower()?.let {
             socialState = socialState.withBlockedNostr(it, blocked)
         }
-        if (blocked) socialState = socialState.withFavoritePeer(key, false)
+        if (blocked) {
+            socialState = socialState.withFavoritePeer(key, false)
+            pendingFavoriteControls.discard(key)
+        }
         persistSocialState()
         toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
         recomputeSociallyFilteredRows()
@@ -1340,7 +1347,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return
             }
             socialState = socialState.withBlockedPeer(peerKey, blocked)
-            if (blocked) socialState = socialState.withFavoritePeer(peerKey, false)
+            if (blocked) {
+                socialState = socialState.withFavoritePeer(peerKey, false)
+                pendingFavoriteControls.discard(peerKey)
+            }
         }
         persistSocialState()
         toast = if (blocked) "Blocked ${name.ifBlank { "channel author" }}" else "Unblocked ${name.ifBlank { "channel author" }}"
@@ -2258,7 +2268,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelPendingMarmotGroupSetups()
 
                 MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear(); pendingFavoriteControls.clear()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
                 linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
@@ -4049,12 +4059,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
-            // Mesh has no album packet — send each over mesh and return. Sending
-            // per-item (not `all {}`, which short-circuits mid-batch) avoids a
-            // partial mesh send that then double-sends via the Marmot album path.
-            for (item in items) sendMeshMedia(meshPeerId(chatId), item.bytes, item.filename, item.mime)
+            // Mesh has no album packet. Attempt every item, then continue only
+            // the failed subset over Marmot so successful BLE photos are never
+            // duplicated and failed BLE photos are never silently lost.
+            val peerId = meshPeerId(chatId)
+            val failed = collectFailedDeliveries(items) { item ->
+                sendMeshMedia(peerId, item.bytes, item.filename, item.mime)
+            }
+            if (failed.isEmpty()) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                val sent = items.size - failed.size
+                toast = if (sent == 0) {
+                    "Photos weren't sent — stay close and try again"
+                } else {
+                    "$sent of ${items.size} photos sent; stay close and retry the rest"
+                }
+                return
+            }
+            sendImageAlbumOverMarmot(chatId, failed)
             return
         }
+        sendImageAlbumOverMarmot(chatId, items)
+    }
+
+    /** Upload [items] without re-entering the BLE route selection above. This is
+     *  also used for a partial album fallback, where a one-item list is valid. */
+    private fun sendImageAlbumOverMarmot(chatId: String, items: List<PickedPhoto>) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
@@ -4121,7 +4151,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
-                toast = "couldn't send photos: ${e.message}"
+                toast = if (items.size == 1) {
+                    "couldn't send photo: ${e.message}"
+                } else {
+                    "couldn't send photos: ${e.message}"
+                }
             }
         }
     }
@@ -4943,7 +4977,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Flush outbox for ALL peers that now have a reachable transport. Called
      *  periodically and on transport-change events. */
     private fun flushAllOutbox() {
-        for (peerId in pendingFavoriteControls.keys.toList()) {
+        for (peerId in pendingFavoriteControls.peerIds()) {
             flushPendingFavoriteControl(peerId)
         }
         if (outbox.isEmpty()) return
@@ -4955,9 +4989,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Deliver the held favorite/unfavorite control once [peerId] has a live
      *  Noise link again (see [pendingFavoriteControls]). */
     private fun flushPendingFavoriteControl(peerId: String) {
-        val payload = pendingFavoriteControls[peerId] ?: return
+        val payload = pendingFavoriteControls.payloadForFlush(
+            peerId,
+            blocked = socialState.isBlockedPeer(peerId),
+        ) ?: return
         if (MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)) {
-            pendingFavoriteControls.remove(peerId)
+            pendingFavoriteControls.delivered(peerId)
         }
     }
 
