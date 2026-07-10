@@ -29,6 +29,7 @@ struct SonarSettingsScreen: View {
     @State private var currencySheet = false
     @State private var exportKeySheet = false
     @State private var diagnosticsSheet = false
+    @State private var linkedDevicesSheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -142,6 +143,12 @@ struct SonarSettingsScreen: View {
                             store.push(.nearby)
                         }
                         SNSettingsRow(
+                            icon: .link, tone: .cyan, label: "Linked devices",
+                            sub: "Use this account on another phone or computer"
+                        ) {
+                            linkedDevicesSheet = true
+                        }
+                        SNSettingsRow(
                             icon: .importKey, tone: .cyan, label: "Export private key",
                             sub: "Move your account to another wallet"
                         ) {
@@ -223,6 +230,9 @@ struct SonarSettingsScreen: View {
         }
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
+        }
+        .snSheet(isPresented: $linkedDevicesSheet, title: "Linked devices") {
+            SNLinkedDevicesSheetContent()
         }
     }
 
