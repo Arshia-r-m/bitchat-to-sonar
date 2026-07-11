@@ -79,6 +79,9 @@ object MeshGatt {
     private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
     private const val MAX_FILE_TRANSFER_BYTES = 1024 * 1024
     private const val MAX_V1_FILE_PAYLOAD_BYTES = 0xFFFF
+    /** Packets waiting behind the single in-flight GATT operation. The queue is
+     * bounded and is destroyed with the current GATT/Noise lifetime. */
+    private const val MAX_PENDING_GATT_PACKETS = 256
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -393,7 +396,7 @@ object MeshGatt {
         val failed = ArrayList<OutboundDelivery>()
         extraDelivery?.let(failed::add)
         serverInFlight.remove(addr)?.delivery?.let(failed::add)
-        serverNotifyQueue.remove(addr)?.mapNotNullTo(failed) { it.delivery }
+        serverNotifyQueue.remove(addr)?.drain()?.mapNotNullTo(failed) { it.delivery }
         serverNotifying.remove(addr)
         val device = serverDevices.remove(addr)
         if (device != null) runCatching { server?.cancelConnection(device) }
@@ -598,7 +601,7 @@ object MeshGatt {
         val failed = ArrayList<OutboundDelivery>()
         extraDelivery?.let(failed::add)
         clientInFlight.remove(addr)?.delivery?.let(failed::add)
-        clientWriteQueue.remove(addr)?.mapNotNullTo(failed) { it.delivery }
+        clientWriteQueue.remove(addr)?.drain()?.mapNotNullTo(failed) { it.delivery }
         clientWriting.remove(addr)
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
         pendingSonarByAddr.remove(addr)
@@ -901,7 +904,12 @@ object MeshGatt {
 
     /** Send an encrypted DM to an established, writable peer route. */
     @Synchronized
-    fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
+    fun sendText(
+        peerAddress: String,
+        messageId: String,
+        text: String,
+        queueIfBusy: Boolean = true,
+    ): Boolean = runCatching {
         val fingerprint = fingerprintByAddr[peerAddress] ?: return@runCatching false
         val delivery = TextDelivery(fingerprint, messageId, text, System.currentTimeMillis() / 1000)
         val client = clientLinks[peerAddress]?.takeIf { it.established }
@@ -909,6 +917,14 @@ object MeshGatt {
         val ch = clientChar[peerAddress]
         if (client != null && gatt != null && ch != null) {
             if (clientWriting.contains(peerAddress) || clientWriteQueue[peerAddress]?.isNotEmpty() == true) {
+                if (!queueIfBusy) return@runCatching false
+                val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, client, messageId, text))
+                val queue = clientWriteQueue.getOrPut(peerAddress) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+                if (queue.tryAddAll(frames.map { OutboundPacket(it, delivery) })) return@runCatching true
+                // Encryption advanced the Noise nonce. Fail this delivery
+                // synchronously and invalidate the link; cleanup returns any
+                // older accepted deliveries to the app-owned router.
+                cleanupClient(peerAddress)
                 return@runCatching false
             }
             val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, client, messageId, text))
@@ -918,6 +934,11 @@ object MeshGatt {
         val device = serverDevices[peerAddress]
         if (server != null && device != null) {
             if (serverNotifying.contains(peerAddress) || serverNotifyQueue[peerAddress]?.isNotEmpty() == true) {
+                if (!queueIfBusy) return@runCatching false
+                val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, server, messageId, text))
+                val queue = serverNotifyQueue.getOrPut(peerAddress) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+                if (queue.tryAddAll(frames.map { OutboundPacket(it, delivery) })) return@runCatching true
+                cleanupServer(peerAddress)
                 return@runCatching false
             }
             val frames = packetFrames(peerAddress, encryptedPrivatePacket(peerAddress, server, messageId, text))
@@ -963,7 +984,8 @@ object MeshGatt {
     /** Immediate send for real-time controls. Never queues. */
     fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
         val addr = sendableAddrFor(fingerprint) ?: return false
-        val sent = sendText(addr, messageId, text)
+        // Call controls are stale-sensitive and must never wait behind a packet.
+        val sent = sendText(addr, messageId, text, queueIfBusy = false)
         if (sent) sendDiscoveryToAddr(addr, "post-control")
         return sent
     }
@@ -1101,13 +1123,21 @@ object MeshGatt {
     // onCharacteristicWrite — so issuing announce + Noise m1 + 0x53 back-to-back
     // silently DROPPED the middle write (the handshake m1), and the Noise DM never
     // established. Serialize: enqueue, issue one at a time, drain on completion.
-    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<OutboundPacket>>()
+    private val clientWriteQueue = ConcurrentHashMap<String, BoundedFifo<OutboundPacket>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val clientInFlight = ConcurrentHashMap<String, OutboundPacket>()
 
+    @Synchronized
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
-        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(OutboundPacket(packet))
-        pumpClientWrites(gatt.device.address)
+        val addr = gatt.device.address
+        val accepted = clientWriteQueue
+            .getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+            .tryAdd(OutboundPacket(packet))
+        if (!accepted) {
+            android.util.Log.w(TAG, "dropping discovery packet: client queue full for $addr")
+            return
+        }
+        pumpClientWrites(addr)
     }
 
     @Synchronized
@@ -1120,14 +1150,17 @@ object MeshGatt {
         val addr = gatt.device.address
         val first = frames.firstOrNull() ?: return false
         val current = OutboundPacket(first, delivery)
-        val queue = clientWriteQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }
-        frames.drop(1).forEach { queue.add(OutboundPacket(it, delivery)) }
+        val queue = clientWriteQueue.getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+        if (!queue.tryAddAll(frames.drop(1).map { OutboundPacket(it, delivery) })) {
+            cleanupClient(addr)
+            return false
+        }
         clientWriting.add(addr)
         clientInFlight[addr] = current
         if (issueWrite(gatt, ch, current.bytes)) return true
         clientInFlight.remove(addr)
         clientWriting.remove(addr)
-        queue.removeIf { it.delivery?.messageId == delivery.messageId }
+        queue.removeAll { it.delivery?.messageId == delivery.messageId }
         cleanupClient(addr, reportPendingFailures = false)
         return false
     }
@@ -1137,7 +1170,7 @@ object MeshGatt {
     private fun pumpClientWrites(addr: String) {
         if (clientWriting.contains(addr)) return
         val q = clientWriteQueue[addr] ?: return
-        val next = q.poll() ?: return
+        val next = q.removeFirstOrNull() ?: return
         val gatt = clientGatt[addr] ?: return
         val ch = clientChar[addr] ?: return
         clientWriting.add(addr)
@@ -1179,13 +1212,21 @@ object MeshGatt {
     // Server notify queue — same one-outstanding-at-a-time rule as client writes
     // (the next notify must wait for onNotificationSent), so the announce + 0x53 +
     // handshake m2 a server emits back-to-back must be serialized or they drop.
-    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<OutboundPacket>>()
+    private val serverNotifyQueue = ConcurrentHashMap<String, BoundedFifo<OutboundPacket>>()
     private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val serverInFlight = ConcurrentHashMap<String, OutboundPacket>()
 
+    @Synchronized
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(OutboundPacket(packet))
-        pumpServerNotify(device.address)
+        val addr = device.address
+        val accepted = serverNotifyQueue
+            .getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+            .tryAdd(OutboundPacket(packet))
+        if (!accepted) {
+            android.util.Log.w(TAG, "dropping discovery packet: server queue full for $addr")
+            return
+        }
+        pumpServerNotify(addr)
     }
 
     @Synchronized
@@ -1208,14 +1249,17 @@ object MeshGatt {
             return false
         }
         val current = OutboundPacket(first, delivery)
-        val queue = serverNotifyQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }
-        frames.drop(1).forEach { queue.add(OutboundPacket(it, delivery)) }
+        val queue = serverNotifyQueue.getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+        if (!queue.tryAddAll(frames.drop(1).map { OutboundPacket(it, delivery) })) {
+            cleanupServer(addr)
+            return false
+        }
         serverNotifying.add(addr)
         serverInFlight[addr] = current
         if (issueNotify(s, device, ch, current.bytes)) return true
         serverInFlight.remove(addr)
         serverNotifying.remove(addr)
-        queue.removeIf { it.delivery?.messageId == delivery.messageId }
+        queue.removeAll { it.delivery?.messageId == delivery.messageId }
         cleanupServer(addr, reportPendingFailures = false)
         return false
     }
@@ -1239,7 +1283,7 @@ object MeshGatt {
     private fun pumpServerNotify(addr: String) {
         if (serverNotifying.contains(addr)) return
         val q = serverNotifyQueue[addr] ?: return
-        val next = q.poll() ?: return
+        val next = q.removeFirstOrNull() ?: return
         val s = server ?: return
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return

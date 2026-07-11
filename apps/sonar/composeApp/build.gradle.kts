@@ -8,7 +8,18 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
     alias(libs.plugins.compose.compiler)
-    alias(libs.plugins.google.services)
+    // Applied below only when a gitignored Firebase configuration is present.
+    // CI can still compile the app without manufacturing production credentials.
+    alias(libs.plugins.google.services) apply false
+}
+
+val hasGoogleServicesConfig = fileTree(projectDir) {
+    include("google-services.json", "src/**/google-services.json")
+}.files.isNotEmpty()
+if (hasGoogleServicesConfig) {
+    apply(plugin = "com.google.gms.google-services")
+} else {
+    logger.lifecycle("google-services.json not present; skipping Google Services resource generation")
 }
 
 // Breez API key from a gitignored secret — NEVER hardcode or commit it.
