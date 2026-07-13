@@ -242,11 +242,9 @@ final class MarmotChatModel: ObservableObject {
     private var benchFirstWakeLogged = false
     private var benchFirstDrainLogged = false
     #endif
+    /// Last locally-authoritative installed set. Generic pack metadata also
+    /// contains previews/transcript packs and must never grant picker access.
     private var installedPackCoordinates: Set<String> = []
-    /// Distinguishes "not hydrated yet" from the authoritative empty set.
-    /// Signal keeps this state in its local database; Sonar mirrors that
-    /// invariant in the app-lifetime store and refreshes relays in background.
-    private var installedPackCoordinatesLoaded = false
     /// npubs whose profile fetch is in flight or done. Entries older than
     /// `profileRefreshTTL` are cleared by `refreshStaleProfiles()` so updated
     /// aliases/names get re-fetched during long sessions.
@@ -302,10 +300,9 @@ final class MarmotChatModel: ObservableObject {
 
     static func shouldExposeCachedStickerPack(
         coordinate: String,
-        installedCoordinates: Set<String>,
-        installedCoordinatesLoaded: Bool
+        installedCoordinates: Set<String>
     ) -> Bool {
-        !installedCoordinatesLoaded || installedCoordinates.contains(coordinate.lowercased())
+        installedCoordinates.contains(coordinate.lowercased())
     }
 
     init(
@@ -1606,8 +1603,7 @@ final class MarmotChatModel: ObservableObject {
         stickerPacksByCoordinate.compactMap { coordinate, pack in
             Self.shouldExposeCachedStickerPack(
                 coordinate: coordinate,
-                installedCoordinates: installedPackCoordinates,
-                installedCoordinatesLoaded: installedPackCoordinatesLoaded
+                installedCoordinates: installedPackCoordinates
             ) ? pack : nil
         }
     }
@@ -1677,14 +1673,12 @@ final class MarmotChatModel: ObservableObject {
         stickerPacksByCoordinate = [:]
         stickerImagesBySHA256 = [:]
         installedPackCoordinates = []
-        installedPackCoordinatesLoaded = false
     }
 
     func fetchInstalledPacks() async -> [String]? {
         do {
             let coords = try await service.fetchInstalledPacks()
             installedPackCoordinates = Set(coords.map { $0.lowercased() })
-            installedPackCoordinatesLoaded = true
             return coords
         } catch {
             self.errorText = Self.describe(error)
@@ -1866,7 +1860,6 @@ final class MarmotChatModel: ObservableObject {
         profileFetches = []
         profileFetchedAt = [:]
         installedPackCoordinates = []
-        installedPackCoordinatesLoaded = false
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
@@ -1889,7 +1882,6 @@ final class MarmotChatModel: ObservableObject {
         profileFetches = []
         profileFetchedAt = [:]
         installedPackCoordinates = []
-        installedPackCoordinatesLoaded = false
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
