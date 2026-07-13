@@ -5012,7 +5012,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isPackInstalled(coordinate: String): Boolean =
         installedPackCoordinates.contains(coordinate.lowercase())
 
-    suspend fun fetchInstalledPacks(): List<String> {
+    suspend fun fetchInstalledPacks(): List<String>? {
         if (installedPackCoordinatesLoaded) {
             scope.launch { refreshInstalledPacks() }
             return installedPackCoordinates.toList()
@@ -5022,7 +5022,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             replaceInstalledPacks(coordinates)
             coordinates
         } catch (_: Throwable) {
-            emptyList()
+            null
         }
     }
 
