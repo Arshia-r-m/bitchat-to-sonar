@@ -12,6 +12,16 @@ import BitLogger
 import CryptoKit
 import SonarCore
 
+func snNormalizeStickerPackCoordinate(_ coordinate: String) -> String {
+    let parts = coordinate.split(
+        separator: ":",
+        maxSplits: 2,
+        omittingEmptySubsequences: false
+    )
+    guard parts.count == 3 else { return coordinate }
+    return "\(parts[0]):\(parts[1].lowercased()):\(parts[2])"
+}
+
 enum SNMarmotProfileCache {
     static let defaultsKey = "marmot.profilesByNpub.v1"
     private static let cacheLimit = 4_096
@@ -308,7 +318,7 @@ final class MarmotChatModel: ObservableObject {
         coordinate: String,
         installedCoordinates: Set<String>
     ) -> Bool {
-        installedCoordinates.contains(coordinate.lowercased())
+        installedCoordinates.contains(snNormalizeStickerPackCoordinate(coordinate))
     }
 
     static func stickerCacheLookupState(
@@ -1738,15 +1748,16 @@ final class MarmotChatModel: ObservableObject {
     /// Cache insertion kept as one production path so identity-reset regression
     /// tests can seed the same picker state that relay hydration creates.
     func rememberStickerPack(_ pack: StickerPackInfo, cacheKey: String) {
-        stickerPacksByCoordinate.removeValue(forKey: cacheKey)
+        let normalized = snNormalizeStickerPackCoordinate(cacheKey)
+        stickerPacksByCoordinate.removeValue(forKey: normalized)
         if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
             stickerPacksByCoordinate.removeValue(forKey: oldest)
         }
-        stickerPacksByCoordinate[cacheKey] = pack
+        stickerPacksByCoordinate[normalized] = pack
     }
 
     func replaceInstalledPackCoordinates(_ coordinates: [String]) {
-        installedPackCoordinates = Set(coordinates.map { $0.lowercased() })
+        installedPackCoordinates = Set(coordinates.map(snNormalizeStickerPackCoordinate))
     }
 
     func fetchInstalledPacks() async -> [String]? {
@@ -1761,13 +1772,13 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func isStickerPackInstalled(_ coordinate: String) -> Bool {
-        installedPackCoordinates.contains(coordinate.lowercased())
+        installedPackCoordinates.contains(snNormalizeStickerPackCoordinate(coordinate))
     }
 
     func installStickerPack(coordinate: String) async -> Bool {
         do {
             try await service.installStickerPack(coordinate: coordinate)
-            installedPackCoordinates.insert(coordinate.lowercased())
+            installedPackCoordinates.insert(snNormalizeStickerPackCoordinate(coordinate))
             return true
         } catch {
             self.errorText = Self.describe(error)
@@ -1778,7 +1789,7 @@ final class MarmotChatModel: ObservableObject {
     func uninstallStickerPack(coordinate: String) async -> Bool {
         do {
             try await service.uninstallStickerPack(coordinate: coordinate)
-            let normalized = coordinate.lowercased()
+            let normalized = snNormalizeStickerPackCoordinate(coordinate)
             installedPackCoordinates.remove(normalized)
             // Signal separates saved/available metadata from installed packs;
             // the composer cache only represents the installed picker surface.
